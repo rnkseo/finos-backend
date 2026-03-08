@@ -30,11 +30,11 @@ CLAUDE_MODEL = "claude-sonnet-4-20250514"
 class AIEngine:
 
     def __init__(self):
-        self.has_claude = bool(ANTHROPIC_API_KEY)
-        if self.has_claude:
-            print("[AI] Anthropic Claude API key found — using Claude for parsing")
-        else:
-            print("[AI] No Anthropic key — using rule-based parser")
+       self.has_claude = bool(GROQ_API_KEY)
+if self.has_claude:
+    print("[AI] Groq API key found — using Llama 3.3 70B")
+else:
+    print("[AI] No Groq key — using rule-based parser")
 
     # ══════════════════════════════════════════════════════════════════════════
     # PUBLIC: parse_message
@@ -72,28 +72,29 @@ class AIEngine:
         user_data: Dict
     ) -> Optional[Dict]:
         system_prompt = self._build_system_prompt(user_id, user_data)
-        payload = {
-            "model": CLAUDE_MODEL,
+  payload = {
+            "model": GROQ_MODEL,
             "max_tokens": 1024,
-            "system": system_prompt,
-            "messages": [{"role": "user", "content": message}]
+            "messages": [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": message}
+            ]
         }
         headers = {
-            "x-api-key": ANTHROPIC_API_KEY,
-            "anthropic-version": "2023-06-01",
+            "Authorization": f"Bearer {GROQ_API_KEY}",
             "content-type": "application/json",
         }
         try:
             async with httpx.AsyncClient(timeout=15.0) as client:
-                resp = await client.post(
-                    "https://api.anthropic.com/v1/messages",
+              resp = await client.post(
+                    "https://api.groq.com/openai/v1/chat/completions",
                     json=payload,
                     headers=headers
                 )
                 resp.raise_for_status()
                 body = resp.json()
-                text = "".join(b.get("text", "") for b in body.get("content", []))
-                return self._parse_json_response(text)
+text = body["choices"][0]["message"]["content"]
+return self._parse_json_response(text)
         except Exception as e:
             print(f"[AI] Claude API error: {e}")
             return None
