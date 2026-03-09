@@ -1,183 +1,210 @@
 """
-FinOS — Personal AI Financial Operating System
-AI Engine — ai_engine.py
-
-Responsibilities:
-  - Parse natural language financial messages → structured intent + data
-  - Generate financial insights from user data
-  - Compute health scores
-  - Generate spending predictions
-  - Produce AI recommendations
-
-Calls Anthropic Claude API when ANTHROPIC_API_KEY is set.
-Falls back to deterministic rule-based parsing otherwise.
+AstraOS — AI Financial Engine v3.0
+Multi-stage financial classification + Groq LLaMA reasoning
+Acts as a CFO: classifies intent → executes financial actions → generates insights
 """
-
-import os
-import re
-import json
-import math
-import httpx
-import asyncio
-from typing import Dict, List, Any, Optional
+import os, re, json, math, httpx
+from typing import Dict, List, Any, Optional, Tuple
 from datetime import datetime, date, timedelta
 from collections import defaultdict
 
-ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
-CLAUDE_MODEL = "claude-sonnet-4-20250514"
+GROQ_API_KEY  = os.environ.get("GROQ_API_KEY", "")
+GROQ_BASE_URL = "https://api.groq.com/openai/v1"
+GROQ_MODEL_MAIN  = "llama-3.3-70b-versatile"   # complex reasoning
+GROQ_MODEL_FAST  = "llama-3.1-8b-instant"       # classification / fast tasks
+
+
+FINANCIAL_SYSTEM_PROMPT = """You are AstraOS CFO — an AI Chief Financial Officer, accountant, and investment manager.
+
+Your role is NOT to chat. Your role is to PARSE financial input and return structured JSON.
+
+You manage a personal finance system with these data types:
+- expenses: daily spending (food, transport, shopping, utilities, health, entertainment, education, rent, other)
+- investments: mutual funds, stocks, crypto, bonds, PPF, FD, NPS
+- sip: systematic investment plan (recurring mutual fund contributions)
+- assets: physical assets (gold, silver, property, vehicle, jewelry)
+- recurring: recurring payments (rent, EMI, subscriptions, bills, insurance)
+- savings: savings goals (emergency fund, vacation, car, house, etc.)
+- debts: loans and liabilities (home loan, car loan, personal loan, credit card)
+- income: salary, freelance, rental income, business income
+
+RETURN ONLY VALID JSON. NO MARKDOWN. NO EXPLANATION. NO PREAMBLE.
+
+JSON structure:
+{
+  "intent": "<expense|investment|sip|asset|recurring|savings|debt|income|update_asset_price|query|ambiguous|general>",
+  "confidence": <0.0-1.0>,
+  "actions": [
+    {
+      "action": "<create_expense|create_investment|create_sip|create_asset|create_recurring|create_savings_goal|create_debt|create_income|update_prices|query_data>",
+      "data": {
+        "description": "<string>",
+        "amount": <number>,
+        "category": "<string>",
+        "date": "<YYYY-MM-DD>",
+        "fund_name": "<string>",
+        "investment_type": "<mutual_fund|stocks|crypto|bonds|ppf|fd|nps|other>",
+        "asset_type": "<gold|silver|property|vehicle|jewelry|other>",
+        "quantity": <number>,
+        "frequency": "<monthly|weekly|yearly|quarterly>",
+        "name": "<string>",
+        "source": "<string>",
+        "creditor": "<string>",
+        "interest_rate": <number>,
+        "emi": <number>,
+        "months_back": <number>,
+        "sip_funds": ["<fund1>", "<fund2>"],
+        "price_per_unit": <number>,
+        "target_amount": <number>,
+        "current_amount": <number>
+      }
+    }
+  ],
+  "clarification_needed": false,
+  "clarification_question": null,
+  "response": "<1-2 sentence professional confirmation>",
+  "financial_impact": {
+    "cash_change": <negative for outflow, positive for inflow>,
+    "asset_change": <increase in asset value>,
+    "investment_change": <increase in investment value>,
+    "debt_change": <increase in debt>
+  },
+  "insights": ["<0-2 brief financial insights>"]
+}
+
+CLASSIFICATION RULES:
+- "spent/bought/paid/purchased/expense" + amount → expense
+- "invested/sip/mutual fund/mf/stock/equity/crypto/ppf/fd/bonds/nps" → investment or sip
+- "gold/silver/property/land/house/vehicle/car/bike" (buying) → asset
+- "every month/weekly/rent/hostel/emi/subscription/recurring" → recurring
+- "saved/saving/goal/emergency fund/target" → savings
+- "loan/borrowed/debt/owe/credit card/mortgage" → debt
+- "salary/income/earned/received/freelance/got paid" → income
+- "gold price/silver rate/price now/current rate" → update_asset_price
+- "show/how much/total/report/summary/balance" → query
+- amount present but type unclear → ambiguous (ask clarification)
+- no financial content → general
+
+SIP DETECTION:
+- "SIP of ₹2000 in HDFC, ICICI, Nippon for 6 months" → create 3 separate sip actions with months_back=6
+- "started SIP 3 months ago" → months_back=3
+- "paying SIP since January" → calculate months_back from January to today
+
+MULTI-ACTION: A single message can produce multiple actions.
+Example: "I have SIP in HDFC and ICICI for ₹2000 each" → 2 sip actions
+
+IMPORTANT: For ambiguous amounts (e.g. "I paid 5000" with no context), set clarification_needed=true."""
 
 
 class AIEngine:
 
     def __init__(self):
-       self.has_claude = bool(GROQ_API_KEY)
-if self.has_claude:
-    print("[AI] Groq API key found — using Llama 3.3 70B")
-else:
-    print("[AI] No Groq key — using rule-based parser")
+        self.has_groq = bool(GROQ_API_KEY)
+        if self.has_groq:
+            print("[AI] Groq API key found — using LLaMA 3.3 70B")
+        else:
+            print("[AI] No Groq key — rule-based parser active")
 
     # ══════════════════════════════════════════════════════════════════════════
-    # PUBLIC: parse_message
+    # PUBLIC: process_message — main entry point
+    # Returns structured result with actions, response, insights
     # ══════════════════════════════════════════════════════════════════════════
-    async def parse_message(
-        self,
-        message: str,
-        user_id: str,
-        user_data: Dict,
-        context: Dict
-    ) -> Dict:
-        """
-        Main entry point. Returns:
-        {
-            "intent": str,
-            "data": dict,
-            "response": str,
-            "insights": list[str]
-        }
-        """
-        if self.has_claude:
-            result = await self._call_claude(message, user_id, user_data)
+    async def process_message(self, message: str, user_id: str,
+                               user_data: Dict, context: Dict = None) -> Dict:
+        context = context or {}
+
+        # Stage 1: Quick safety/relevance check
+        if self._is_injection_attempt(message):
+            return self._safe_response("I can only help with financial management tasks.")
+
+        # Stage 2: Try Groq AI classification
+        if self.has_groq:
+            result = await self._call_groq(message, user_id, user_data)
             if result:
                 return result
-        # Fallback
+
+        # Stage 3: Rule-based fallback
         return self._rule_based_parse(message, user_data)
 
     # ══════════════════════════════════════════════════════════════════════════
-    # CLAUDE API CALL
+    # GROQ API CALL
     # ══════════════════════════════════════════════════════════════════════════
-    async def _call_claude(
-        self,
-        message: str,
-        user_id: str,
-        user_data: Dict
-    ) -> Optional[Dict]:
-        system_prompt = self._build_system_prompt(user_id, user_data)
-  payload = {
-            "model": GROQ_MODEL,
-            "max_tokens": 1024,
-            "messages": [
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": message}
-            ]
-        }
-        headers = {
-            "Authorization": f"Bearer {GROQ_API_KEY}",
-            "content-type": "application/json",
-        }
+    async def _call_groq(self, message: str, user_id: str, user_data: Dict) -> Optional[Dict]:
+        summary = user_data.get("summary", {})
+        today = date.today().isoformat()
+
+        context_snippet = f"""User financial context (today: {today}):
+- Net worth: ₹{summary.get('net_worth', 0):,.0f}
+- Cash balance (est.): ₹{summary.get('cash_balance', 0):,.0f}
+- Monthly expenses so far: ₹{summary.get('month_expenses', 0):,.0f}
+- Total invested: ₹{summary.get('total_invested', 0):,.0f}
+- Portfolio value: ₹{summary.get('total_portfolio_value', 0):,.0f}
+- Active SIPs: {summary.get('sip_count', 0)}
+- Total debt: ₹{summary.get('total_debt', 0):,.0f}"""
+
+        messages = [
+            {"role": "system", "content": FINANCIAL_SYSTEM_PROMPT},
+            {"role": "user", "content": f"{context_snippet}\n\nUser message: {message}"}
+        ]
+
         try:
-            async with httpx.AsyncClient(timeout=15.0) as client:
-              resp = await client.post(
-                    "https://api.groq.com/openai/v1/chat/completions",
-                    json=payload,
-                    headers=headers
+            async with httpx.AsyncClient(timeout=20.0) as client:
+                resp = await client.post(
+                    f"{GROQ_BASE_URL}/chat/completions",
+                    headers={
+                        "Authorization": f"Bearer {GROQ_API_KEY}",
+                        "Content-Type": "application/json",
+                    },
+                    json={
+                        "model": GROQ_MODEL_MAIN,
+                        "messages": messages,
+                        "max_tokens": 1500,
+                        "temperature": 0.1,  # Low temp for consistent JSON
+                    }
                 )
                 resp.raise_for_status()
                 body = resp.json()
-text = body["choices"][0]["message"]["content"]
-return self._parse_json_response(text)
+                text = body["choices"][0]["message"]["content"]
+                return self._parse_json_response(text)
         except Exception as e:
-            print(f"[AI] Claude API error: {e}")
+            print(f"[AI] Groq error: {e}")
             return None
 
-    def _build_system_prompt(self, user_id: str, user_data: Dict) -> str:
-        expenses    = user_data.get("expenses", [])
-        investments = user_data.get("investments", [])
-        savings     = user_data.get("savings", [])
-        recurring   = user_data.get("recurring", [])
-        assets      = user_data.get("assets", [])
-
-        today = date.today().isoformat()
-        current_month = datetime.now().strftime("%Y-%m")
-        monthly_spend = sum(
-            e["amount"] for e in expenses
-            if (e.get("date") or "").startswith(current_month)
-        )
-        total_invested = sum(i["amount"] for i in investments)
-        total_savings  = sum(s["amount"] for s in savings)
-
-        return f"""You are FinOS AI — an expert personal financial assistant for user '{user_id}'.
-
-Current financial snapshot (today: {today}):
-- Monthly expenses so far: ₹{monthly_spend:,.0f}
-- Total invested: ₹{total_invested:,.0f}
-- Total savings: ₹{total_savings:,.0f}
-- Active recurring payments: {len(recurring)}
-- Physical assets tracked: {len(assets)}
-
-Your job: parse the user's natural language message about their finances and return ONLY valid JSON.
-
-Return this exact JSON structure (no markdown, no preamble, no extra text):
-{{
-  "intent": "<one of: add_expense | add_investment | add_asset | add_recurring | add_saving | update_asset_price | query_report | query_health | query_insights | general_chat>",
-  "data": {{
-    "description": "<short description>",
-    "amount": <rupee amount as number, 0 if none>,
-    "category": "<food|transport|shopping|utilities|health|entertainment|education|other>",
-    "date": "<YYYY-MM-DD, default today: {today}>",
-    "asset_type": "<gold|silver|property|vehicle|other>",
-    "quantity": <numeric quantity, 0 if none>,
-    "fund_name": "<fund or stock name if present>",
-    "investment_type": "<mutual_fund|stocks|crypto|bonds|ppf|fd|other>",
-    "frequency": "<monthly|weekly|yearly|quarterly>",
-    "payment_name": "<name of recurring payment>",
-    "account": "<savings account or goal name>",
-    "price_per_unit": <price per gram or unit if mentioned, else 0>
-  }},
-  "response": "<warm, concise, professional confirmation or answer — 1-2 sentences>",
-  "insights": ["<optional: 0-2 short insight strings based on the new data>"]
-}}
-
-Classification rules:
-- "spent/bought/paid/purchased" → add_expense
-- "invested/SIP/mutual fund/stock/crypto/bond/PPF/FD" → add_investment
-- "gold/silver/property/vehicle" (buying) → add_asset
-- "every month/weekly/monthly/rent/hostel/EMI/subscription" → add_recurring
-- "saved/saving/savings/deposit" → add_saving
-- silver/gold price update → update_asset_price
-- "show report/analytics/chart/how much" → query_report
-- "health score/financial health" → query_health
-- anything else → general_chat
-
-Category detection for expenses:
-food/lunch/dinner/breakfast/chai/tea/coffee/restaurant/snack → food
-petrol/fuel/bus/auto/cab/uber/ola/train/metro/toll → transport
-shirt/clothes/shopping/amazon/flipkart/dress/t-shirt/shoes → shopping
-electricity/bill/internet/mobile/recharge/wifi/gas → utilities
-doctor/medicine/hospital/medical/pharmacy/clinic → health
-movie/game/netflix/spotify/entertainment/concert → entertainment
-course/book/college/school/fee/tuition → education
-
-ONLY return the JSON object. Nothing else."""
+    async def _call_groq_analysis(self, prompt: str) -> Optional[str]:
+        """Call Groq for free-form analysis/insights."""
+        if not self.has_groq:
+            return None
+        try:
+            async with httpx.AsyncClient(timeout=30.0) as client:
+                resp = await client.post(
+                    f"{GROQ_BASE_URL}/chat/completions",
+                    headers={
+                        "Authorization": f"Bearer {GROQ_API_KEY}",
+                        "Content-Type": "application/json",
+                    },
+                    json={
+                        "model": GROQ_MODEL_MAIN,
+                        "messages": [
+                            {"role": "system", "content": "You are an expert financial analyst. Be concise, precise, and data-driven. Provide actionable insights in 3-5 bullet points."},
+                            {"role": "user", "content": prompt}
+                        ],
+                        "max_tokens": 800,
+                        "temperature": 0.3,
+                    }
+                )
+                resp.raise_for_status()
+                return resp.json()["choices"][0]["message"]["content"]
+        except Exception as e:
+            print(f"[AI] Analysis error: {e}")
+            return None
 
     def _parse_json_response(self, text: str) -> Optional[Dict]:
         text = text.strip()
-        # Strip markdown fences if present
         text = re.sub(r"^```(?:json)?\s*", "", text)
         text = re.sub(r"\s*```$", "", text)
         try:
             return json.loads(text)
         except json.JSONDecodeError:
-            # Try to extract first { ... } block
             match = re.search(r"\{.*\}", text, re.DOTALL)
             if match:
                 try:
@@ -187,7 +214,7 @@ ONLY return the JSON object. Nothing else."""
         return None
 
     # ══════════════════════════════════════════════════════════════════════════
-    # RULE-BASED PARSER (fallback)
+    # RULE-BASED PARSER (fallback when no Groq)
     # ══════════════════════════════════════════════════════════════════════════
     def _rule_based_parse(self, message: str, user_data: Dict) -> Dict:
         lower = message.lower()
@@ -195,123 +222,204 @@ ONLY return the JSON object. Nothing else."""
         amount = self._extract_amount(message)
         detected_date = self._extract_date(message) or today
 
-        intent = "general_chat"
-        data: Dict[str, Any] = {"amount": amount, "date": detected_date}
-        response = ""
-        insights: List[str] = []
+        # Detect intent
+        if re.search(r"\b(salary|income|earned|received|freelance|got paid|credited)\b", lower):
+            return self._build_action("income", [{
+                "action": "create_income",
+                "data": {
+                    "source": self._extract_source(message) or "Salary",
+                    "amount": amount,
+                    "date": detected_date,
+                }
+            }], f"Income of ₹{amount:,.0f} recorded. 💰",
+            financial_impact={"cash_change": amount})
 
-        # ── Expense ──────────────────────────────────────────────────────────
-        if re.search(r"\b(spent|spend|bought|buy|paid|pay|purchased|purchase|expense|cost)\b", lower):
-            intent = "add_expense"
-            category = self._detect_expense_category(lower)
-            data["category"] = category
-            data["description"] = message.strip()
-            response = f"Got it! ₹{amount:,.0f} logged under {category}. 📝"
-            if amount > 2000:
-                insights.append(f"That's a significant {category} expense. You may want to track this category closely.")
+        if re.search(r"\b(spent|spend|bought|buy|paid|pay|purchased|expense|cost|eating|ate)\b", lower):
+            cat = self._detect_expense_category(lower)
+            return self._build_action("expense", [{
+                "action": "create_expense",
+                "data": {
+                    "description": message.strip(),
+                    "amount": amount,
+                    "category": cat,
+                    "date": detected_date,
+                }
+            }], f"₹{amount:,.0f} expense recorded under {cat}. 📝",
+            financial_impact={"cash_change": -amount})
 
-        # ── Investment ────────────────────────────────────────────────────────
-        elif re.search(r"\b(invest|invested|sip|mutual fund|stock|crypto|ppf|fd|bond|nifty|sensex)\b", lower):
-            intent = "add_investment"
+        if re.search(r"\b(sip|systematic investment)\b", lower):
+            funds = self._extract_multiple_funds(message)
+            months_back = self._extract_months_back(message)
+            if not funds:
+                funds = [self._extract_fund_name(message) or "Mutual Fund"]
+            actions = [{
+                "action": "create_sip",
+                "data": {
+                    "fund_name": fund,
+                    "amount": amount,
+                    "frequency": "monthly",
+                    "months_back": months_back,
+                    "investment_type": "mutual_fund",
+                }
+            } for fund in funds]
+            total = amount * len(funds) * months_back if months_back else amount * len(funds)
+            return self._build_action("sip", actions,
+                f"SIP of ₹{amount:,.0f}/month set up for {', '.join(funds)}. 📈",
+                financial_impact={"cash_change": -total, "investment_change": total})
+
+        if re.search(r"\b(invest|invested|mutual fund|stock|crypto|ppf|fd|bond|nifty)\b", lower):
             inv_type = self._detect_investment_type(lower)
             fund_name = self._extract_fund_name(message) or "Investment"
-            data["fund_name"] = fund_name
-            data["investment_type"] = inv_type
-            response = f"Investment of ₹{amount:,.0f} in {fund_name} recorded! 📈"
-            if amount >= 5000:
-                insights.append("Great job investing! Consistent SIPs build significant wealth over time.")
+            return self._build_action("investment", [{
+                "action": "create_investment",
+                "data": {
+                    "fund_name": fund_name,
+                    "amount": amount,
+                    "investment_type": inv_type,
+                    "date": detected_date,
+                }
+            }], f"₹{amount:,.0f} invested in {fund_name}. 📈",
+            financial_impact={"cash_change": -amount, "investment_change": amount})
 
-        # ── Asset: gold/silver/property ────────────────────────────────────
-        elif re.search(r"\b(gold|silver|property|land|house|vehicle|car|bike)\b", lower):
+        if re.search(r"\b(gold|silver|property|land|house|vehicle|car|bike)\b", lower):
             if re.search(r"\b(price|rate|now|today|current)\b", lower):
-                intent = "update_asset_price"
                 asset_type = "gold" if "gold" in lower else "silver"
-                data["asset_type"] = asset_type
-                response = f"Got it! I'll update the current {asset_type} price to ₹{amount:,.0f}. 💰"
+                return self._build_action("update_asset_price", [{
+                    "action": "update_prices",
+                    "data": {"asset_type": asset_type, "price_per_unit": amount}
+                }], f"{asset_type.title()} price updated to ₹{amount:,.0f}/gram. 💛")
             else:
-                intent = "add_asset"
-                asset_type = (
-                    "gold" if "gold" in lower
-                    else "silver" if "silver" in lower
-                    else "property" if re.search(r"property|land|house", lower)
-                    else "vehicle"
-                )
+                asset_type = self._detect_asset_type(lower)
                 qty = self._extract_quantity(message)
-                data["asset_type"] = asset_type
-                data["quantity"] = qty
-                data["description"] = f"{asset_type} purchase"
-                response = f"Asset recorded: {qty}g of {asset_type} at ₹{amount:,.0f}. 🥇"
+                return self._build_action("asset", [{
+                    "action": "create_asset",
+                    "data": {
+                        "asset_type": asset_type,
+                        "quantity": qty,
+                        "purchase_price": amount,
+                        "description": f"{qty}g {asset_type}" if asset_type in ("gold","silver") else asset_type,
+                        "date": detected_date,
+                    }
+                }], f"{asset_type.title()} asset recorded: {qty} units at ₹{amount:,.0f}. 🥇",
+                financial_impact={"cash_change": -amount, "asset_change": amount})
 
-        # ── Recurring ─────────────────────────────────────────────────────────
-        elif re.search(r"\b(every|monthly|weekly|annual|yearly|recurring|rent|hostel|emi|subscription|subscribe)\b", lower):
-            intent = "add_recurring"
-            freq = (
-                "weekly"    if "weekly" in lower or "every week" in lower
-                else "yearly"  if re.search(r"yearly|annual|every year", lower)
-                else "quarterly" if "quarterly" in lower
-                else "monthly"
-            )
-            payment_name = self._extract_payment_name(message) or message.strip()
-            data["payment_name"] = payment_name
-            data["frequency"] = freq
-            data["category"] = self._detect_recurring_category(lower)
-            response = f"Recurring payment '{payment_name}' of ₹{amount:,.0f}/{freq} set up! 🔔"
+        if re.search(r"\b(every|monthly|weekly|recurring|rent|hostel|emi|subscription)\b", lower):
+            freq = self._detect_frequency(lower)
+            name = self._extract_payment_name(message) or message[:40]
+            cat = self._detect_recurring_category(lower)
+            return self._build_action("recurring", [{
+                "action": "create_recurring",
+                "data": {
+                    "name": name,
+                    "amount": amount,
+                    "frequency": freq,
+                    "category": cat,
+                }
+            }], f"Recurring payment '{name}' of ₹{amount:,.0f}/{freq} scheduled. 🔔")
 
-        # ── Saving ─────────────────────────────────────────────────────────
-        elif re.search(r"\b(saved|saving|savings|deposit|deposited|set aside)\b", lower):
-            intent = "add_saving"
-            account = self._extract_account_name(message) or "General Savings"
-            data["description"] = message.strip()
-            data["account"] = account
-            response = f"₹{amount:,.0f} added to {account}. Keep saving! 💪"
+        if re.search(r"\b(saved|saving|goal|emergency|target|fund)\b", lower):
+            goal_name = self._extract_account_name(message) or "Savings Goal"
+            return self._build_action("savings", [{
+                "action": "create_savings_goal",
+                "data": {
+                    "goal_name": goal_name,
+                    "current_amount": amount,
+                    "target_amount": amount,
+                }
+            }], f"₹{amount:,.0f} added to {goal_name}. 🎯",
+            financial_impact={"cash_change": -amount})
 
-        # ── Report query ──────────────────────────────────────────────────
-        elif re.search(r"\b(report|analytics|chart|graph|show|display|summarize|summary|how much)\b", lower):
-            intent = "query_report"
-            response = "Here's an overview of your finances. Detailed charts are in the Analytics section. 📊"
+        if re.search(r"\b(loan|borrowed|debt|owe|mortgage|emi due)\b", lower):
+            return self._build_action("debt", [{
+                "action": "create_debt",
+                "data": {
+                    "debt_type": "personal",
+                    "creditor": "Unknown",
+                    "principal": amount,
+                    "description": message.strip(),
+                }
+            }], f"Debt of ₹{amount:,.0f} recorded. 📋",
+            financial_impact={"debt_change": amount})
 
-        # ── Health score ──────────────────────────────────────────────────
-        elif re.search(r"\b(health score|financial health|score|how.*(doing|am i))\b", lower):
-            intent = "query_health"
-            score_data = self.compute_health_score(user_data)
-            response = f"Your financial health score is {score_data['score']}/100. {score_data['summary']} 💡"
+        if re.search(r"\b(show|how much|total|report|summary|balance|health|score|analytics)\b", lower):
+            return self._build_action("query", [{
+                "action": "query_data",
+                "data": {"query_type": "summary"}
+            }], "Here's your financial summary. Check the dashboard for detailed analytics. 📊")
 
-        # ── Fallback ──────────────────────────────────────────────────────
-        else:
-            intent = "general_chat"
-            response = (
-                "I'm your FinOS AI assistant! You can tell me about:\n"
-                "• Expenses: 'I spent ₹500 on food'\n"
-                "• Investments: 'I invested ₹5000 in HDFC Mutual Fund'\n"
-                "• Assets: 'I bought 10g of gold for ₹6000'\n"
-                "• Recurring: 'I pay ₹2000 rent monthly'\n"
-                "• Savings: 'I saved ₹3000 this month'"
-            )
+        # Ambiguous amount
+        if amount > 0:
+            return {
+                "intent": "ambiguous",
+                "confidence": 0.4,
+                "actions": [],
+                "clarification_needed": True,
+                "clarification_question": f"I see ₹{amount:,.0f}. Was this an expense, investment, income, or savings?",
+                "response": f"I see ₹{amount:,.0f} mentioned. Could you clarify: was this an expense, investment, income, or savings?",
+                "financial_impact": {},
+                "insights": []
+            }
 
+        return self._build_action("general", [], (
+            "I'm your AstraOS CFO. Tell me about:\n"
+            "• Expenses: 'Spent ₹500 on food'\n"
+            "• Investments: 'Invested ₹5000 in HDFC Mutual Fund'\n"
+            "• SIP: 'SIP of ₹2000 in Nippon India for 6 months'\n"
+            "• Assets: 'Bought 10g gold for ₹72000'\n"
+            "• Income: 'Received salary ₹50000'\n"
+            "• Recurring: 'Pay ₹8000 rent monthly'"
+        ))
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # HELPER BUILDERS
+    # ══════════════════════════════════════════════════════════════════════════
+    def _build_action(self, intent: str, actions: list, response: str,
+                      financial_impact: dict = None, insights: list = None) -> Dict:
         return {
             "intent": intent,
-            "data": data,
+            "confidence": 0.8,
+            "actions": actions,
+            "clarification_needed": False,
+            "clarification_question": None,
             "response": response,
-            "insights": insights
+            "financial_impact": financial_impact or {},
+            "insights": insights or [],
         }
 
+    def _safe_response(self, msg: str) -> Dict:
+        return self._build_action("blocked", [], msg)
+
+    def _is_injection_attempt(self, text: str) -> bool:
+        patterns = [
+            r"ignore previous", r"ignore all", r"disregard",
+            r"you are now", r"pretend you", r"act as",
+            r"system prompt", r"jailbreak", r"DAN mode",
+        ]
+        lower = text.lower()
+        return any(re.search(p, lower) for p in patterns)
+
     # ══════════════════════════════════════════════════════════════════════════
-    # HELPER EXTRACTORS
+    # EXTRACTORS
     # ══════════════════════════════════════════════════════════════════════════
     def _extract_amount(self, text: str) -> float:
-        # Match ₹500, Rs 500, 500 rupees, 500
         patterns = [
-            r"₹\s*([\d,]+(?:\.\d+)?)",
-            r"[Rr][Ss]\.?\s*([\d,]+(?:\.\d+)?)",
+            r"₹\s*([\d,]+(?:\.\d+)?)\s*(?:k|K|lakh|L|cr)?",
+            r"[Rr][Ss]\.?\s*([\d,]+(?:\.\d+)?)\s*(?:k|K|lakh|L)?",
             r"([\d,]+(?:\.\d+)?)\s*(?:rupees?|rs\.?)",
             r"\b([\d,]+(?:\.\d+)?)\b",
         ]
+        multipliers = {"k": 1000, "K": 1000, "lakh": 100000, "L": 100000, "cr": 10000000}
         for pat in patterns:
             m = re.search(pat, text)
             if m:
                 try:
                     val = float(m.group(1).replace(",", ""))
                     if val > 0:
+                        # Check for multiplier suffix
+                        suffix_match = re.search(r"([\d,]+)\s*(k|K|lakh|L|cr)\b", text)
+                        if suffix_match:
+                            val = float(suffix_match.group(1).replace(",", ""))
+                            val *= multipliers.get(suffix_match.group(2), 1)
                         return val
                 except ValueError:
                     pass
@@ -324,6 +432,9 @@ ONLY return the JSON object. Nothing else."""
             return today.isoformat()
         if "yesterday" in lower:
             return (today - timedelta(days=1)).isoformat()
+        if "last month" in lower:
+            first = today.replace(day=1) - timedelta(days=1)
+            return first.replace(day=1).isoformat()
         m = re.search(r"(\d{4}-\d{2}-\d{2})", text)
         if m:
             return m.group(1)
@@ -339,48 +450,88 @@ ONLY return the JSON object. Nothing else."""
         return None
 
     def _extract_quantity(self, text: str) -> float:
-        m = re.search(r"(\d+(?:\.\d+)?)\s*(?:gram|grams|gm|g\b|kg|kilogram)", text, re.IGNORECASE)
+        m = re.search(r"([\d.]+)\s*(?:gram|grams|gm|g\b|kg)", text, re.I)
         if m:
             val = float(m.group(1))
             if "kg" in m.group().lower():
                 val *= 1000
             return val
-        m = re.search(r"(\d+(?:\.\d+)?)", text)
+        m = re.search(r"([\d.]+)\s*(?:sqft|sq\.?ft|square feet)", text, re.I)
         if m:
             return float(m.group(1))
-        return 1.0
+        m = re.search(r"([\d.]+)", text)
+        return float(m.group(1)) if m else 1.0
 
     def _extract_fund_name(self, text: str) -> Optional[str]:
-        # Try to find text after "in" or "into"
-        m = re.search(r"\b(?:in|into)\s+([A-Za-z][A-Za-z0-9\s&]+?)(?:\s+(?:fund|mutual|for|of|at|₹|rs)|\s*$)", text, re.IGNORECASE)
+        m = re.search(
+            r"\b(?:in|into|for)\s+([A-Za-z][A-Za-z0-9\s&]+?)(?:\s+(?:fund|mutual|for|at|₹|rs|sip)|\s*$)",
+            text, re.I
+        )
         if m:
             name = m.group(1).strip()
-            if len(name) > 2:
+            if 2 < len(name) < 40:
                 return name
         return None
 
+    def _extract_multiple_funds(self, text: str) -> List[str]:
+        """Extract multiple fund names from a comma/and separated list."""
+        # Pattern: "in HDFC, ICICI, and Nippon" or "in HDFC and ICICI"
+        m = re.search(r"\bin\s+((?:[A-Za-z][A-Za-z0-9\s&]+?)(?:,\s*(?:and\s+)?[A-Za-z][A-Za-z0-9\s&]+)*)", text, re.I)
+        if m:
+            raw = m.group(1)
+            # Split by comma and "and"
+            parts = re.split(r",\s*(?:and\s+)?|\s+and\s+", raw)
+            funds = [p.strip() for p in parts if p.strip() and len(p.strip()) > 2]
+            if len(funds) > 1:
+                return funds
+        return []
+
+    def _extract_months_back(self, text: str) -> int:
+        """Extract how many months back a SIP has been running."""
+        m = re.search(r"(\d+)\s*months?\s*(?:ago|back|since|for)", text, re.I)
+        if m:
+            return int(m.group(1))
+        # "since January" type
+        months = {
+            "january": 1, "february": 2, "march": 3, "april": 4,
+            "may": 5, "june": 6, "july": 7, "august": 8,
+            "september": 9, "october": 10, "november": 11, "december": 12
+        }
+        today = date.today()
+        for mon_name, mon_num in months.items():
+            if mon_name in text.lower():
+                diff = (today.month - mon_num) % 12
+                return max(1, diff)
+        return 0
+
     def _extract_payment_name(self, text: str) -> Optional[str]:
-        # Try to extract the main subject
-        m = re.search(r"(?:pay|paying|payment for|pay for)\s+([A-Za-z][A-Za-z0-9\s]+?)(?:\s+(?:every|for|of|₹|rs|\d)|$)", text, re.IGNORECASE)
+        m = re.search(r"(?:pay|paying|payment for|pay for)\s+([A-Za-z][A-Za-z0-9\s]+?)(?:\s+(?:every|for|of|₹|rs|\d)|$)", text, re.I)
         if m:
             return m.group(1).strip()
         return None
 
     def _extract_account_name(self, text: str) -> Optional[str]:
-        m = re.search(r"(?:in|into|to|for)\s+([A-Za-z][A-Za-z0-9\s]+?)(?:\s+(?:account|fund|wallet|goal)|\s*$)", text, re.IGNORECASE)
+        m = re.search(r"(?:in|into|to|for)\s+([A-Za-z][A-Za-z0-9\s]+?)(?:\s+(?:account|fund|wallet|goal)|$)", text, re.I)
         if m:
             return m.group(1).strip()
         return None
 
+    def _extract_source(self, text: str) -> Optional[str]:
+        m = re.search(r"(?:from|via|by|as)\s+([A-Za-z][A-Za-z0-9\s]+?)(?:\s+|\.|$)", text, re.I)
+        if m:
+            return m.group(1).strip()
+        return "Salary"
+
     def _detect_expense_category(self, lower: str) -> str:
         rules = [
-            ("food",          r"food|lunch|dinner|breakfast|chai|tea|coffee|restaurant|hotel|snack|meal|biryani|dosa|idly|swiggy|zomato|eat|drink"),
-            ("transport",     r"petrol|fuel|bus|auto|cab|uber|ola|train|metro|toll|diesel|rapido|bike|travel|ticket|fare"),
-            ("shopping",      r"shirt|clothes|shopping|amazon|flipkart|dress|t.shirt|shoes|bag|jeans|fashion|mall|cloth"),
-            ("utilities",     r"electricity|bill|internet|mobile|recharge|wifi|gas|water|broadband|dth|cable"),
-            ("health",        r"doctor|medicine|hospital|medical|pharmacy|clinic|health|tablet|injection|dental|eye"),
-            ("entertainment", r"movie|game|netflix|spotify|prime|entertainment|concert|event|theatre|cricket|match|pub|bar"),
-            ("education",     r"course|book|college|school|fee|tuition|coaching|class|tutorial|udemy|study"),
+            ("food",          r"food|lunch|dinner|breakfast|chai|tea|coffee|restaurant|snack|meal|biryani|swiggy|zomato|eat|drink|hotel"),
+            ("transport",     r"petrol|fuel|bus|auto|cab|uber|ola|train|metro|toll|diesel|rapido|travel|ticket|fare"),
+            ("shopping",      r"shirt|clothes|shopping|amazon|flipkart|dress|shoes|bag|mall|cloth|purchase"),
+            ("utilities",     r"electricity|bill|internet|mobile|recharge|wifi|gas|water|broadband"),
+            ("health",        r"doctor|medicine|hospital|medical|pharmacy|clinic|tablet|dental"),
+            ("entertainment", r"movie|game|netflix|spotify|prime|concert|event|pub|bar"),
+            ("education",     r"course|book|college|school|fee|tuition|coaching|udemy"),
+            ("rent",          r"rent|hostel|pg|accommodation|house|flat|room"),
         ]
         for cat, pattern in rules:
             if re.search(pattern, lower):
@@ -388,194 +539,236 @@ ONLY return the JSON object. Nothing else."""
         return "other"
 
     def _detect_investment_type(self, lower: str) -> str:
-        if re.search(r"mutual fund|mf|sip|flexi|bluechip|midcap|smallcap|largecap|debt fund|hybrid", lower):
+        if re.search(r"mutual fund|mf|sip|flexi|bluechip|midcap|smallcap|largecap|debt fund|hybrid|nav", lower):
             return "mutual_fund"
         if re.search(r"stock|share|nifty|sensex|equity|ipo|bse|nse|zerodha|groww", lower):
             return "stocks"
-        if re.search(r"crypto|bitcoin|btc|eth|ethereum|solana|usdt|coin", lower):
+        if re.search(r"crypto|bitcoin|btc|eth|ethereum|solana|usdt", lower):
             return "crypto"
-        if re.search(r"bond|debenture|ncd|government bond|g-sec", lower):
+        if re.search(r"bond|debenture|g-sec|government", lower):
             return "bonds"
         if re.search(r"\bppf\b|public provident", lower):
             return "ppf"
-        if re.search(r"\bfd\b|fixed deposit|recurring deposit|\brd\b", lower):
+        if re.search(r"\bfd\b|fixed deposit|\brd\b|recurring deposit", lower):
             return "fd"
+        if re.search(r"\bnps\b|national pension", lower):
+            return "nps"
         return "other"
 
+    def _detect_asset_type(self, lower: str) -> str:
+        if "gold" in lower:
+            return "gold"
+        if "silver" in lower:
+            return "silver"
+        if re.search(r"property|land|house|flat|plot", lower):
+            return "property"
+        if re.search(r"vehicle|car|bike|motorcycle|scooter", lower):
+            return "vehicle"
+        if "jewelry" in lower or "jewel" in lower:
+            return "jewelry"
+        return "other"
+
+    def _detect_frequency(self, lower: str) -> str:
+        if re.search(r"weekly|every week", lower):
+            return "weekly"
+        if re.search(r"yearly|annual|every year", lower):
+            return "yearly"
+        if "quarterly" in lower:
+            return "quarterly"
+        return "monthly"
+
     def _detect_recurring_category(self, lower: str) -> str:
-        if re.search(r"rent|hostel|pg|accommodation|house|flat|room", lower):
+        if re.search(r"rent|hostel|pg|house|flat|room", lower):
             return "housing"
         if re.search(r"electricity|internet|mobile|wifi|gas|water|bill", lower):
             return "utilities"
-        if re.search(r"emi|loan|mortgage|car loan|home loan|personal loan", lower):
+        if re.search(r"emi|loan|mortgage", lower):
             return "loan"
-        if re.search(r"netflix|spotify|prime|subscription|saas|software|app", lower):
+        if re.search(r"netflix|spotify|prime|subscription", lower):
             return "subscriptions"
-        if re.search(r"insurance|lic|policy|premium|health insurance", lower):
+        if re.search(r"insurance|lic|policy|premium", lower):
             return "insurance"
-        if re.search(r"petrol|fuel|bus pass|train pass|metro", lower):
-            return "transport"
         return "other"
 
     # ══════════════════════════════════════════════════════════════════════════
     # FINANCIAL HEALTH SCORE
     # ══════════════════════════════════════════════════════════════════════════
     def compute_health_score(self, user_data: Dict) -> Dict:
+        summary = user_data.get("summary", {})
         expenses    = user_data.get("expenses", [])
         investments = user_data.get("investments", [])
         assets      = user_data.get("assets", [])
         savings     = user_data.get("savings", [])
         recurring   = user_data.get("recurring", [])
+        debts       = user_data.get("debts", [])
+        income      = user_data.get("income", [])
+        sips        = user_data.get("sips", [])
 
-        total_expenses   = sum(e.get("amount", 0) for e in expenses)
-        total_savings    = sum(s.get("amount", 0) for s in savings)
-        total_invested   = sum(i.get("amount", 0) for i in investments)
-        assets_value     = sum(a.get("current_value", a.get("purchase_price", 0)) for a in assets)
+        total_income     = summary.get("total_income", sum(i.get("amount", 0) for i in income))
+        total_expenses   = summary.get("total_expenses", sum(e.get("amount", 0) for e in expenses))
+        total_invested   = summary.get("total_invested", sum(i.get("invested_amount", 0) for i in investments))
+        total_portfolio  = summary.get("total_portfolio_value", total_invested)
+        total_assets     = summary.get("total_asset_value", sum(a.get("current_value", 0) for a in assets))
+        total_savings    = summary.get("total_savings", sum(s.get("current_amount", 0) for s in savings))
+        total_debt       = summary.get("total_debt", sum(d.get("remaining", d.get("principal", 0)) for d in debts))
+        net_worth        = summary.get("net_worth", 0)
         monthly_recurring = sum(r.get("amount", 0) for r in recurring if r.get("frequency") == "monthly")
 
-        scores: Dict[str, int] = {}
+        scores = {}
 
         # 1. Savings rate (0-25)
-        total_financial = total_expenses + total_savings
-        savings_rate = (total_savings / total_financial * 100) if total_financial > 0 else 0
-        scores["savings_rate"] = min(25, int(savings_rate * 0.5))
-
-        # 2. Expense control (0-25)
-        # Lower recurring-to-savings ratio is better
-        if total_savings > 0:
-            rec_ratio = monthly_recurring / (total_savings / 12 + 1)
-            scores["expense_control"] = min(25, max(0, int(25 - rec_ratio * 5)))
+        total_cash_flow = total_income + total_expenses
+        if total_income > 0:
+            savings_rate = (total_savings / total_income * 100)
+            scores["savings_rate"] = min(25, int(savings_rate * 0.5))
+        elif total_savings > 0:
+            scores["savings_rate"] = 10
         else:
-            scores["expense_control"] = 5 if len(expenses) > 0 else 0
+            scores["savings_rate"] = 0
 
-        # 3. Investment diversity (0-25)
-        inv_types = len(set(i.get("type", "other") for i in investments))
-        inv_score = min(20, inv_types * 7)
-        if total_invested > 10000:
-            inv_score = min(25, inv_score + 5)
+        # 2. Expense control (0-25): recurring vs income ratio
+        if total_income > 0:
+            expense_ratio = total_expenses / total_income
+            scores["expense_control"] = max(0, min(25, int((1 - expense_ratio) * 30)))
+        elif total_expenses > 0:
+            scores["expense_control"] = 5
+        else:
+            scores["expense_control"] = 0
+
+        # 3. Investment diversity (0-25): variety + size
+        inv_types = set(i.get("investment_type", "other") for i in investments)
+        active_sips = len([s for s in sips if s.get("is_active")])
+        inv_score = min(15, len(inv_types) * 5) + min(10, active_sips * 3)
+        if total_portfolio > 50000:
+            inv_score = min(25, inv_score + 3)
         scores["investment_diversity"] = inv_score
 
-        # 4. Asset coverage (0-25)
-        asset_types = len(set(a.get("asset_type", "other") for a in assets))
-        asset_score = min(20, asset_types * 8)
-        if assets_value > 5000:
-            asset_score = min(25, asset_score + 5)
-        scores["asset_coverage"] = asset_score
+        # 4. Debt management (0-25): low debt relative to assets
+        if net_worth > 0:
+            debt_ratio = total_debt / (net_worth + total_debt + 1)
+            scores["debt_management"] = max(0, min(25, int((1 - debt_ratio) * 25)))
+        elif total_debt == 0:
+            scores["debt_management"] = 15
+        else:
+            scores["debt_management"] = 0
 
         total_score = sum(scores.values())
 
-        if total_score >= 75:
-            grade = "A"
-            summary = "Excellent financial health! Your saving, investing, and asset-building habits are strong."
+        if total_score >= 80:
+            grade, summary_text = "A+", "Exceptional financial health! You're building wealth strategically."
+        elif total_score >= 70:
+            grade, summary_text = "A", "Excellent! Strong savings, diverse investments, and managed debt."
         elif total_score >= 60:
-            grade = "B"
-            summary = "Good financial health. Consider diversifying investments and building more savings."
-        elif total_score >= 40:
-            grade = "C"
-            summary = "Moderate financial health. Focus on increasing your savings rate and reducing recurring outflows."
-        elif total_score >= 20:
-            grade = "D"
-            summary = "Needs improvement. Start tracking all expenses and set a monthly savings goal immediately."
+            grade, summary_text = "B", "Good financial health. Small improvements can push you to excellent."
+        elif total_score >= 45:
+            grade, summary_text = "C", "Moderate. Focus on increasing investments and reducing debt."
+        elif total_score >= 25:
+            grade, summary_text = "D", "Needs work. Prioritize emergency fund and debt reduction."
         else:
-            grade = "F"
-            summary = "Getting started. Log your first expenses and savings to begin your financial journey."
+            grade, summary_text = "F", "Getting started. Every rupee tracked is a step forward."
 
         return {
             "score": total_score,
             "grade": grade,
-            "summary": summary,
-            "breakdown": {
-                "savings_rate":          scores["savings_rate"],
-                "expense_control":       scores["expense_control"],
-                "investment_diversity":  scores["investment_diversity"],
-                "asset_coverage":        scores["asset_coverage"],
-            },
-            "max_score": 100
+            "summary": summary_text,
+            "breakdown": scores,
+            "max_score": 100,
+            "areas_to_improve": self._get_improvement_areas(scores, user_data),
         }
+
+    def _get_improvement_areas(self, scores: Dict, user_data: Dict) -> List[str]:
+        areas = []
+        if scores.get("savings_rate", 0) < 15:
+            areas.append("Increase savings rate — aim for 20% of income")
+        if scores.get("expense_control", 0) < 12:
+            areas.append("Reduce discretionary spending")
+        if scores.get("investment_diversity", 0) < 12:
+            areas.append("Diversify investments across mutual funds, stocks, and gold")
+        if scores.get("debt_management", 0) < 12:
+            areas.append("Pay down high-interest debt faster")
+        return areas[:3]
 
     # ══════════════════════════════════════════════════════════════════════════
     # INSIGHTS GENERATOR
     # ══════════════════════════════════════════════════════════════════════════
     def generate_insights(self, user_data: Dict) -> List[str]:
-        expenses    = user_data.get("expenses", [])
+        summary = user_data.get("summary", {})
+        expenses = user_data.get("expenses", [])
         investments = user_data.get("investments", [])
-        savings     = user_data.get("savings", [])
-        recurring   = user_data.get("recurring", [])
+        savings = user_data.get("savings", [])
+        recurring = user_data.get("recurring", [])
+        sips = user_data.get("sips", [])
 
-        insights: List[str] = []
+        insights = []
         today = datetime.now()
         current_month = f"{today.year}-{str(today.month).zfill(2)}"
 
-        # Monthly spend
-        monthly_expenses = sum(
-            e["amount"] for e in expenses
-            if (e.get("date") or "").startswith(current_month)
-        )
-        if monthly_expenses > 0:
-            daily_avg = monthly_expenses / today.day
-            insights.append(f"Daily average spend this month: ₹{daily_avg:,.0f}")
+        # Monthly spend pace
+        month_expenses = summary.get("month_expenses", 0)
+        if month_expenses > 0 and today.day > 0:
+            daily_avg = month_expenses / today.day
+            projected = daily_avg * 30
+            insights.append(f"At this pace, monthly spend will be ₹{projected:,.0f}")
 
         # Category breakdown
-        cat_totals: Dict[str, float] = defaultdict(float)
-        for e in expenses:
+        cat_totals = defaultdict(float)
+        for e in expenses[-50:]:  # Last 50 expenses
             cat_totals[e.get("category", "other")] += e.get("amount", 0)
         if cat_totals:
             top_cat, top_val = max(cat_totals.items(), key=lambda x: x[1])
-            insights.append(f"Highest spend category: {top_cat} at ₹{top_val:,.0f} total")
+            insights.append(f"Top spending: {top_cat} at ₹{top_val:,.0f} total")
 
-        # Savings momentum
-        total_savings = sum(s.get("amount", 0) for s in savings)
-        if total_savings > 0 and monthly_expenses > 0:
-            months_covered = total_savings / monthly_expenses
-            insights.append(f"Your savings cover {months_covered:.1f} months of current spending")
-
-        # Investment return
-        total_invested = sum(i.get("amount", 0) for i in investments)
-        total_current  = sum(i.get("current_value", i.get("amount", 0)) for i in investments)
+        # Portfolio performance
+        total_invested = summary.get("total_invested", 0)
+        total_portfolio = summary.get("total_portfolio_value", 0)
         if total_invested > 0:
-            pnl_pct = ((total_current - total_invested) / total_invested) * 100
-            direction = "up" if pnl_pct >= 0 else "down"
-            insights.append(f"Portfolio is {direction} {abs(pnl_pct):.1f}% overall")
+            gain_pct = summary.get("portfolio_gain_pct", 0)
+            direction = "📈 up" if gain_pct >= 0 else "📉 down"
+            insights.append(f"Portfolio is {direction} {abs(gain_pct):.1f}% (₹{abs(total_portfolio - total_invested):,.0f})")
 
-        # Recurring burden
-        monthly_recurring = sum(
-            r.get("amount", 0) for r in recurring if r.get("frequency") == "monthly"
-        )
-        if monthly_recurring > 0 and monthly_expenses > 0:
-            rec_pct = (monthly_recurring / monthly_expenses) * 100
-            insights.append(f"Recurring payments are {rec_pct:.0f}% of your monthly expenses")
+        # SIP summary
+        active_sips = [s for s in sips if s.get("is_active")]
+        if active_sips:
+            total_sip = sum(s.get("amount", 0) for s in active_sips)
+            insights.append(f"{len(active_sips)} active SIPs investing ₹{total_sip:,.0f}/month")
 
-        # Alert: high spending day
-        day_totals: Dict[str, float] = defaultdict(float)
-        for e in expenses:
-            if e.get("date"):
-                day_totals[e["date"]] += e.get("amount", 0)
-        if day_totals:
-            peak_day, peak_val = max(day_totals.items(), key=lambda x: x[1])
-            if peak_val > 1000:
-                insights.append(f"Highest spending day: {peak_day} at ₹{peak_val:,.0f}")
+        # Upcoming recurring
+        today_str = date.today().isoformat()
+        upcoming = [r for r in recurring if r.get("next_due", "") >= today_str]
+        if upcoming:
+            next_due = upcoming[0]
+            insights.append(f"Next payment: {next_due.get('name')} ₹{next_due.get('amount', 0):,.0f} on {next_due.get('next_due')}")
 
-        return insights[:6]  # Return top 6 insights
+        # Savings progress
+        for goal in savings[:2]:
+            target = goal.get("target_amount", 0)
+            current = goal.get("current_amount", 0)
+            if target > 0:
+                pct = min(100, current / target * 100)
+                insights.append(f"Goal '{goal.get('goal_name')}': {pct:.0f}% complete (₹{current:,.0f}/₹{target:,.0f})")
+
+        return insights[:6]
 
     # ══════════════════════════════════════════════════════════════════════════
-    # PREDICTIONS
+    # PREDICTIONS / FORECAST
     # ══════════════════════════════════════════════════════════════════════════
     def generate_predictions(self, user_data: Dict) -> Dict:
-        expenses    = user_data.get("expenses", [])
+        expenses = user_data.get("expenses", [])
         investments = user_data.get("investments", [])
-        savings     = user_data.get("savings", [])
-        recurring   = user_data.get("recurring", [])
+        summary = user_data.get("summary", {})
+        sips = user_data.get("sips", [])
+        recurring = user_data.get("recurring", [])
 
         today = datetime.now()
 
-        # Monthly expense history for last 6 months
-        monthly_data: Dict[str, float] = {}
+        # Monthly expense history
+        monthly_data = {}
         for i in range(5, -1, -1):
-            yr  = today.year if today.month - i > 0 else today.year - 1
-            mo  = (today.month - i - 1) % 12 + 1
+            mo = (today.month - i - 1) % 12 + 1
+            yr = today.year if (today.month - i) > 0 else today.year - 1
             key = f"{yr}-{str(mo).zfill(2)}"
             monthly_data[key] = sum(
-                e["amount"] for e in expenses
+                e.get("amount", 0) for e in expenses
                 if (e.get("date") or "").startswith(key)
             )
 
@@ -584,6 +777,7 @@ ONLY return the JSON object. Nothing else."""
         avg_monthly = sum(non_zero) / len(non_zero) if non_zero else 0
 
         # Linear trend
+        slope = 0
         if len(non_zero) >= 2:
             n = len(non_zero)
             x_mean = (n - 1) / 2
@@ -591,80 +785,76 @@ ONLY return the JSON object. Nothing else."""
             num = sum((i - x_mean) * (v - y_mean) for i, v in enumerate(non_zero))
             den = sum((i - x_mean) ** 2 for i in range(n))
             slope = num / den if den != 0 else 0
-        else:
-            slope = 0
 
         # 6-month expense forecast
         expense_forecast = []
         for i in range(1, 7):
-            mo_date = date(today.year, today.month, 1)
-            # advance i months
-            new_mo = (mo_date.month + i - 1) % 12 + 1
-            new_yr = mo_date.year + (mo_date.month + i - 1) // 12
-            label = datetime(new_yr, new_mo, 1).strftime("%b %y")
+            new_mo = (today.month + i - 1) % 12 + 1
+            new_yr = today.year + (today.month + i - 1) // 12
+            label = datetime(new_yr, new_mo, 1).strftime("%b '%y")
             predicted = max(0, round(avg_monthly + slope * i))
-            expense_forecast.append({"month": label, "predicted": predicted})
+            expense_forecast.append({"month": label, "predicted": predicted, "baseline": round(avg_monthly)})
 
-        # 12-month investment projection at 12% annual (1% per month)
-        total_invested  = sum(i.get("amount", 0) for i in investments)
-        total_current   = sum(i.get("current_value", i.get("amount", 0)) for i in investments)
+        # Investment projection (SIP compounding)
+        total_portfolio = summary.get("total_portfolio_value", 0)
+        monthly_sip_total = sum(s.get("amount", 0) for s in sips if s.get("is_active"))
+
         invest_forecast = []
-        base = total_current or total_invested
+        base = total_portfolio
         for i in range(1, 13):
             new_mo = (today.month + i - 1) % 12 + 1
             new_yr = today.year + (today.month + i - 1) // 12
-            label = datetime(new_yr, new_mo, 1).strftime("%b %y")
-            projected = round(base * math.pow(1.01, i))
-            invest_forecast.append({"month": label, "projected": projected})
+            label = datetime(new_yr, new_mo, 1).strftime("%b '%y")
+            # Compound at 12% annual (1% per month) + monthly SIP
+            base = base * 1.01 + monthly_sip_total
+            invest_forecast.append({"month": label, "projected": round(base), "sip_contribution": monthly_sip_total})
 
-        # Savings projection
-        total_savings = sum(s.get("amount", 0) for s in savings)
-        monthly_recurring = sum(r.get("amount", 0) for r in recurring if r.get("frequency") == "monthly")
-        savings_6mo = round(total_savings + max(0, (avg_monthly * 0.2 - monthly_recurring)) * 6)
-
-        # AI recommendation
-        recommendation = self._generate_recommendation(
-            avg_monthly, total_invested, total_savings, slope, monthly_recurring
-        )
+        # Net worth projection
+        net_worth = summary.get("net_worth", 0)
+        nw_forecast = []
+        nw = net_worth
+        for i in range(1, 7):
+            new_mo = (today.month + i - 1) % 12 + 1
+            new_yr = today.year + (today.month + i - 1) // 12
+            label = datetime(new_yr, new_mo, 1).strftime("%b '%y")
+            # Net worth grows by portfolio appreciation minus predicted expenses
+            nw += monthly_sip_total * 1.01 - max(0, avg_monthly - summary.get("month_income", 0) / today.month * 30)
+            nw_forecast.append({"month": label, "net_worth": round(nw)})
 
         return {
-            "expense_forecast":     expense_forecast,
+            "expense_history": [{"month": k, "amount": v} for k, v in monthly_data.items()],
+            "expense_forecast": expense_forecast,
             "investment_projection": invest_forecast,
+            "net_worth_forecast": nw_forecast,
             "predicted_monthly_expense": round(avg_monthly + slope),
-            "predicted_investment_return_12mo": round(base * math.pow(1.01, 12) - base),
-            "predicted_savings_6mo": savings_6mo,
-            "ai_recommendation":    recommendation,
-            "trend": "increasing" if slope > 50 else "decreasing" if slope < -50 else "stable"
+            "predicted_sip_corpus_12mo": round(invest_forecast[-1]["projected"] if invest_forecast else base),
+            "trend": "increasing" if slope > 100 else "decreasing" if slope < -100 else "stable",
+            "monthly_sip_total": monthly_sip_total,
+            "ai_recommendation": self._generate_recommendation(user_data, avg_monthly, slope),
         }
 
-    def _generate_recommendation(
-        self,
-        avg_expense: float,
-        total_invested: float,
-        total_savings: float,
-        trend: float,
-        monthly_recurring: float
-    ) -> str:
-        if avg_expense == 0 and total_invested == 0 and total_savings == 0:
-            return ("Start by recording your daily expenses for 30 days. "
-                    "Once you understand your spending patterns, allocate 20% of income to savings "
-                    "and start a ₹500/month SIP in a diversified equity mutual fund.")
+    def _generate_recommendation(self, user_data: Dict, avg_expense: float, trend: float) -> str:
+        summary = user_data.get("summary", {})
+        sips = user_data.get("sips", [])
+        debts = user_data.get("debts", [])
 
         tips = []
-        if trend > 100:
-            tips.append(f"Your expenses are trending upward by ₹{trend:,.0f}/month. "
-                        "Identify and cut discretionary spending.")
-        if total_savings > 0 and avg_expense > 0:
-            runway = total_savings / avg_expense
-            if runway < 3:
-                tips.append("Build an emergency fund of at least 3 months of expenses before investing aggressively.")
-        if total_invested == 0 and total_savings > 10000:
-            tips.append("You have savings but no investments. Consider starting a monthly SIP even at ₹1,000 to beat inflation.")
-        if monthly_recurring > avg_expense * 0.5:
-            tips.append(f"₹{monthly_recurring:,.0f} in recurring payments is over 50% of your average monthly spend — review subscriptions.")
+        net_worth = summary.get("net_worth", 0)
+        total_debt = summary.get("total_debt", 0)
+        total_invested = summary.get("total_invested", 0)
+        active_sips = len([s for s in sips if s.get("is_active")])
 
-        if tips:
-            return " ".join(tips)
-        return ("You're managing your finances well. "
-                "Continue your current saving and investment habits. "
-                "Consider rebalancing your portfolio every 6 months for optimal returns.")
+        if trend > 200:
+            tips.append(f"Expenses growing by ₹{trend:.0f}/month — review discretionary spending.")
+        if total_debt > net_worth * 0.4 and total_debt > 0:
+            tips.append("Debt is >40% of net worth. Prioritize debt reduction.")
+        if active_sips == 0 and total_invested < 10000:
+            tips.append("Start a monthly SIP of at least ₹500 to build long-term wealth.")
+        if active_sips > 0 and active_sips < 3:
+            tips.append("Consider diversifying across 3-4 SIPs in different fund categories.")
+        if avg_expense > 0 and summary.get("total_savings", 0) < avg_expense * 3:
+            tips.append("Build an emergency fund of 3-6 months of expenses before aggressive investing.")
+
+        if not tips:
+            return ("Your financial trajectory looks healthy. Continue regular SIP investments and maintain emergency reserves. Consider annual portfolio rebalancing.")
+        return " ".join(tips)
