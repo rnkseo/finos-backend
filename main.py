@@ -1,38 +1,40 @@
 """
 AstraOS — FastAPI Backend
-Handles data persistence + Grok AI proxy
+Handles data persistence + Groq AI proxy (llama-3.3-70b)
 """
 import os, json
 from fastapi import FastAPI, Header, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from typing import Optional, Any
+from typing import Optional
 import httpx
 from database import Database
 
 app = FastAPI(title="AstraOS API")
-
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
 db = Database()
 
-GROK_API_KEY = os.environ.get("GROK_API_KEY", "")
-GROK_BASE_URL = "https://api.x.ai/v1"
+# ── Groq config (uses gsk_ key) ──────────────────────────
+GROQ_API_KEY  = os.environ.get("GROQ_API_KEY", "")
+GROQ_BASE_URL = "https://api.groq.com/openai/v1"
+GROQ_MODEL    = "llama-3.3-70b-versatile"
 
-VALID_USERS = {"naveen","sri","ramesh","raja"}
+VALID_USERS = {"naveen", "sri", "ramesh", "raja"}
 
-def get_user(x_user: Optional[str] = Header(None)) -> str:
+def get_user(x_user: Optional[str] = None) -> str:
     u = (x_user or "").lower().strip()
     if u not in VALID_USERS:
         raise HTTPException(status_code=401, detail="Invalid user")
     return u
 
-# ─── HEALTH ───────────────────────────────────────────────
+# ── Health ───────────────────────────────────────────────
 @app.get("/api/health")
-def health(): return {"status": "ok", "version": "2.0"}
+def health():
+    return {"status": "ok", "version": "2.0", "ai": "groq/llama-3.3-70b"}
 
-# ─── CRUD ENDPOINTS ───────────────────────────────────────
-COLLECTIONS = ["expenses","investments","assets","recurring","debts","savings"]
+# ── CRUD ─────────────────────────────────────────────────
+COLLECTIONS = ["expenses", "investments", "assets", "recurring", "debts", "savings"]
 
 class RecordBody(BaseModel):
     data: dict
@@ -66,30 +68,40 @@ def delete_record(collection: str, record_id: str, x_user: Optional[str] = Heade
     db.delete_record(user, collection, record_id)
     return {"success": True}
 
-# ─── GROK AI PROXY ────────────────────────────────────────
+# ── Groq AI Proxy ─────────────────────────────────────────
 class ChatBody(BaseModel):
     messages: list
-    model: Optional[str] = "grok-3-latest"
+    model: Optional[str] = None
     system: Optional[str] = None
 
 @app.post("/api/chat")
 async def chat(body: ChatBody, x_user: Optional[str] = Header(None)):
     user = get_user(x_user)
-    if not GROK_API_KEY:
-        raise HTTPException(status_code=503, detail="GROK_API_KEY not configured")
+    if not GROQ_API_KEY:
+        raise HTTPException(status_code=503, detail="GROQ_API_KEY not set in environment")
 
     msgs = body.messages
     if body.system:
-        msgs = [{"role":"system","content":body.system}] + msgs
+        msgs = [{"role": "system", "content": body.system}] + msgs
+
+    model = body.model or GROQ_MODEL
 
     async with httpx.AsyncClient(timeout=60) as client:
         r = await client.post(
-            f"{GROK_BASE_URL}/chat/completions",
-            headers={"Authorization": f"Bearer {GROK_API_KEY}", "Content-Type": "application/json"},
-            json={"model": body.model, "messages": msgs, "max_tokens": 2000, "temperature": 0.7}
+            f"{GROQ_BASE_URL}/chat/completions",
+            headers={
+                "Authorization": f"Bearer {GROQ_API_KEY}",
+                "Content-Type": "application/json"
+            },
+            json={
+                "model": model,
+                "messages": msgs,
+                "max_tokens": 2000,
+                "temperature": 0.7
+            }
         )
         if r.status_code != 200:
             raise HTTPException(status_code=r.status_code, detail=r.text)
         data = r.json()
         content = data["choices"][0]["message"]["content"]
-        return {"content": content, "model": body.model}
+        return {"content": content, "model": model}
