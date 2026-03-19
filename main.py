@@ -1,635 +1,708 @@
-"""
-AstraOS — FastAPI Backend v3.0
-Financial action execution engine + AI orchestration + market data
-"""
-import os, json, asyncio
-from fastapi import FastAPI, Header, HTTPException, BackgroundTasks
-from fastapi.middleware.cors import CORSMiddleware
+from fastapi import FastAPI
 from pydantic import BaseModel
-from typing import Optional, List, Any
-from datetime import datetime, date, timedelta
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
+import aiohttp
+import asyncio
+from bs4 import BeautifulSoup
+from urllib.parse import urlparse, urljoin, urldefrag
+import os
+import json
+import re
+from collections import Counter
 
-from database import Database, VALID_USERS
-from ai_engine import AIEngine
-from market_data import get_market_service
+app = FastAPI(title="SearchRNK SERP Compare API")
 
-# ── App Setup ────────────────────────────────────────────────────────────────
-app = FastAPI(title="AstraOS API", version="3.0.0")
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=["https://www.searchrnk.com", "https://searchrnk.com", "*"],
+    allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-db = Database()
-ai = AIEngine()
-market = get_market_service(db)
-
-# ── Auth ──────────────────────────────────────────────────────────────────────
-VALID_USERS_PASSWORDS = {
-    "naveen": "neevaN",
-    "sri": "irS",
-    "ramesh": "hsemaR",
-    "raja": "ajaR"
+HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Connection": "keep-alive",
 }
 
-def get_user(x_user: Optional[str] = None) -> str:
-    u = (x_user or "").lower().strip()
-    if u not in VALID_USERS:
-        raise HTTPException(status_code=401, detail="Invalid user. Use: naveen, sri, ramesh, raja")
-    return u
 
-# ── Models ─────────────────────────────────────────────────────────────────────
-class LoginBody(BaseModel):
-    username: str
-    password: str
+class CompareRequest(BaseModel):
+    keyword: str
+    user_url: str
+    competitor_urls: list
+    manual_data: dict = {}   # keyed by URL: {da, pa, backlinks, plagiarism}
 
-class ChatBody(BaseModel):
-    message: str
-    context: Optional[dict] = None
 
-class RecordBody(BaseModel):
-    data: dict
+# ─────────────────────────────────────────────
+# UTILS
+# ─────────────────────────────────────────────
 
-class SIPPayBody(BaseModel):
-    sip_id: str
+def normalize_url(url: str) -> str:
+    try:
+        url, _ = urldefrag(url)
+        p = urlparse(url)
+        path = p.path.rstrip("/") or "/"
+        return f"{p.scheme.lower()}://{p.netloc.lower()}{path}"
+    except Exception:
+        return url
 
-class SavingsUpdateBody(BaseModel):
-    goal_id: str
-    amount: float
 
-class MarketUpdateBody(BaseModel):
-    symbol: str
-    price: float
-    asset_class: Optional[str] = "commodity"
+def detect_intent(url: str, title: str, h1: str) -> str:
+    combined = f"{url} {title} {h1}".lower()
+    if any(w in combined for w in ["buy", "shop", "price", "order", "purchase", "cart", "checkout"]):
+        return "Transactional"
+    if any(w in combined for w in ["best", "top", "review", "compare", "vs", "versus", "ranking", "rated"]):
+        return "Commercial Investigation"
+    return "Informational"
 
-# ── Health ─────────────────────────────────────────────────────────────────────
-@app.get("/api/health")
-def health():
-    return {
-        "status": "ok",
-        "version": "3.0",
-        "ai": "groq/llama-3.3-70b",
-        "timestamp": datetime.utcnow().isoformat(),
-        "features": ["financial-engine", "market-data", "sip-management", "health-score", "predictions"]
-    }
 
-# ── Auth ───────────────────────────────────────────────────────────────────────
-@app.post("/api/login")
-def login(body: LoginBody):
-    username = body.username.lower().strip()
-    password = body.password
-    expected = VALID_USERS_PASSWORDS.get(username)
-    if not expected or expected != password:
-        raise HTTPException(status_code=401, detail="Invalid credentials")
-    return {
-        "success": True,
-        "user": username,
-        "display_name": username.capitalize(),
-        "message": f"Welcome back, {username.capitalize()}!"
-    }
+def detect_content_type(h2_count: int, word_count: int, title: str, h1: str) -> str:
+    combined = f"{title} {h1}".lower()
+    if any(w in combined for w in ["top ", "best ", "list of", " ways", "tips ", "reasons", "examples"]):
+        return "Listicle"
+    if any(w in combined for w in ["how to", "guide", "tutorial", "step by step"]):
+        return "How-to Guide"
+    if h2_count >= 8 and word_count >= 2000:
+        return "Long-form Article"
+    if word_count < 700:
+        return "Short Article"
+    return "Article"
 
-# ── MAIN CHAT / AI FINANCIAL PROCESSOR ────────────────────────────────────────
-@app.post("/api/chat")
-async def chat(body: ChatBody, background_tasks: BackgroundTasks,
-               x_user: Optional[str] = Header(None)):
-    user = get_user(x_user)
-    message = (body.message or "").strip()
-    if not message:
-        raise HTTPException(400, detail="Empty message")
 
-    # Get full user financial context
-    user_data = db.get_full_user_data(user)
+def compute_readability(text: str) -> str:
+    sentences = re.split(r"[.!?]+", text)
+    sentences = [s.strip() for s in sentences if len(s.strip().split()) > 3]
+    if not sentences:
+        return "Unknown"
+    avg = sum(len(s.split()) for s in sentences) / len(sentences)
+    if avg < 15:
+        return "Easy"
+    if avg < 25:
+        return "Moderate"
+    return "Hard"
 
-    # AI processes the message
-    result = await ai.process_message(message, user, user_data, body.context or {})
 
-    # Execute financial actions based on AI decision
-    executed = []
-    errors = []
-    if not result.get("clarification_needed") and result.get("actions"):
-        for action in result["actions"]:
-            try:
-                action_result = await _execute_action(user, action, user_data)
-                executed.append(action_result)
-            except Exception as e:
-                errors.append({"action": action.get("action"), "error": str(e)})
-
-    # Generate post-action insights if something was executed
-    if executed:
-        # Refresh user data for accurate insights
-        refreshed_data = db.get_full_user_data(user)
-        insights = ai.generate_insights(refreshed_data)
-        updated_summary = refreshed_data.get("summary", {})
-    else:
-        insights = result.get("insights", [])
-        updated_summary = user_data.get("summary", {})
-
-    # Generate notifications for important events
-    if executed:
-        background_tasks.add_task(_generate_notifications, user, executed)
-
-    return {
-        "response": result.get("response", "Processed."),
-        "intent": result.get("intent"),
-        "clarification_needed": result.get("clarification_needed", False),
-        "clarification_question": result.get("clarification_question"),
-        "executed_actions": executed,
-        "errors": errors,
-        "financial_impact": result.get("financial_impact", {}),
-        "insights": insights,
-        "summary": updated_summary,
-    }
-
-async def _execute_action(user: str, action: dict, user_data: dict) -> dict:
-    """Execute a single financial action and return result."""
-    action_type = action.get("action")
-    data = action.get("data", {})
-    today = date.today().isoformat()
-
-    if action_type == "create_expense":
-        record = db.add_transaction(
-            user_id=user,
-            tx_type="expense",
-            category=data.get("category", "other"),
-            description=data.get("description", ""),
-            amount=float(data.get("amount", 0)),
-            date_str=data.get("date", today),
-            metadata=data.get("metadata", {})
-        )
-        return {"type": "expense_created", "record": record}
-
-    elif action_type == "create_income":
-        record = db.add_income(
-            user_id=user,
-            source=data.get("source", "Income"),
-            amount=float(data.get("amount", 0)),
-            date_str=data.get("date", today),
-            is_recurring=data.get("is_recurring", False),
-        )
-        # Also record as transaction
-        db.add_transaction(user, "income", data.get("source", "income"),
-                           data.get("source", "Income"),
-                           float(data.get("amount", 0)), data.get("date", today))
-        return {"type": "income_created", "record": record}
-
-    elif action_type == "create_investment":
-        amount = float(data.get("amount", 0))
-        record = db.add_investment(
-            user_id=user,
-            fund_name=data.get("fund_name", "Investment"),
-            inv_type=data.get("investment_type", "other"),
-            amount=amount,
-            start_date=data.get("date", today),
-        )
-        # Record as transaction (cash outflow)
-        db.add_transaction(user, "investment", data.get("investment_type", "investment"),
-                           f"Investment in {data.get('fund_name', 'Fund')}", amount, data.get("date", today))
-        return {"type": "investment_created", "record": record}
-
-    elif action_type == "create_sip":
-        amount = float(data.get("amount", 0))
-        fund_name = data.get("fund_name", "Mutual Fund")
-        months_back = int(data.get("months_back", 0))
-
-        # Create investment record first
-        total_invested = amount * max(1, months_back)
-        inv_record = db.add_investment(
-            user_id=user,
-            fund_name=fund_name,
-            inv_type="mutual_fund",
-            amount=total_invested,
-            start_date=data.get("start_date", today),
-        )
-
-        # Create SIP schedule
-        sip_record = db.add_sip(
-            user_id=user,
-            fund_name=fund_name,
-            amount=amount,
-            frequency=data.get("frequency", "monthly"),
-            investment_id=inv_record["id"],
-            months_back=months_back,
-        )
-
-        # Record historical transactions
-        if months_back > 0:
-            today_date = date.today()
-            for m in range(months_back, 0, -1):
-                hist_date = today_date.replace(day=1) - timedelta(days=1)
-                for _ in range(m - 1):
-                    hist_date = hist_date.replace(day=1) - timedelta(days=1)
-                hist_date = hist_date.replace(day=min(today_date.day, 28))
-                db.add_transaction(user, "investment", "mutual_fund",
-                                   f"SIP: {fund_name}", amount, hist_date.isoformat())
-
-        # Try to fetch current NAV
+def detect_schema(soup) -> list:
+    schemas = []
+    for script in soup.find_all("script", type="application/ld+json"):
         try:
-            nav_data = await market.fetch_mutual_fund_nav(fund_name)
-            if nav_data and nav_data.get("nav") and amount > 0:
-                units = total_invested / nav_data["nav"]
-                current_val = units * nav_data["nav"]
-                db.update_investment_value(user, inv_record["id"], current_val, nav_data["nav"])
-                inv_record.update({"units": units, "nav": nav_data["nav"], "current_value": current_val})
+            data = json.loads(script.string or "{}")
+            if isinstance(data, dict):
+                t = data.get("@type", "")
+                if t:
+                    schemas.append(str(t))
+            elif isinstance(data, list):
+                for item in data:
+                    if isinstance(item, dict):
+                        t = item.get("@type", "")
+                        if t:
+                            schemas.append(str(t))
+        except Exception:
+            pass
+    return list(set(schemas))
+
+
+def extract_date(soup) -> str:
+    # <time datetime="">
+    time_tag = soup.find("time", attrs={"datetime": True})
+    if time_tag:
+        return time_tag.get("datetime", "")[:10]
+
+    # meta property
+    for prop in ["article:published_time", "og:article:published_time", "article:modified_time"]:
+        m = soup.find("meta", property=prop)
+        if m and m.get("content"):
+            return m["content"][:10]
+
+    # itemprop
+    for itemprop in ["datePublished", "dateModified"]:
+        m = soup.find(attrs={"itemprop": itemprop})
+        if m:
+            val = m.get("content") or m.get_text(strip=True)
+            if val:
+                return str(val)[:10]
+
+    # JSON-LD
+    for script in soup.find_all("script", type="application/ld+json"):
+        try:
+            data = json.loads(script.string or "{}")
+            if isinstance(data, dict):
+                date = data.get("datePublished") or data.get("dateModified")
+                if date:
+                    return str(date)[:10]
         except Exception:
             pass
 
-        return {"type": "sip_created", "sip": sip_record, "investment": inv_record}
+    return "Not Found"
 
-    elif action_type == "create_asset":
-        amount = float(data.get("purchase_price", data.get("amount", 0)))
-        qty = float(data.get("quantity", 1))
-        asset_type = data.get("asset_type", "other")
 
-        # Try to get current market price for valuation
-        current_value = amount
-        if asset_type == "gold":
-            market_data = db.get_market_price("GOLD_INR_GRAM")
-            if market_data:
-                current_value = qty * market_data["price"]
-        elif asset_type == "silver":
-            market_data = db.get_market_price("SILVER_INR_GRAM")
-            if market_data:
-                current_value = qty * market_data["price"]
+def extract_keyword_variations(text: str, keyword: str, top: int = 8) -> list:
+    words = re.findall(r"\b[a-z]+\b", text.lower())
+    kw_parts = set(keyword.lower().split())
 
-        record = db.add_asset(
-            user_id=user,
-            asset_type=asset_type,
-            description=data.get("description", f"{qty} {asset_type}"),
-            quantity=qty,
-            purchase_price=amount,
-            current_value=current_value,
-            purchase_date=data.get("date", today),
+    bigrams = [f"{words[i]} {words[i+1]}" for i in range(len(words) - 1)]
+    trigrams = [f"{words[i]} {words[i+1]} {words[i+2]}" for i in range(len(words) - 2)]
+
+    relevant = [ng for ng in bigrams + trigrams
+                if any(kp in ng for kp in kw_parts) and ng != keyword.lower()]
+
+    counter = Counter(relevant)
+    return [ng for ng, _ in counter.most_common(top)]
+
+
+def compute_seo_score(data: dict, keyword: str) -> int:
+    score = 0
+
+    # 1. Content Depth (25pts)
+    wc = data.get("word_count", 0)
+    if wc >= 2500:
+        score += 20
+    elif wc >= 1500:
+        score += 14
+    elif wc >= 800:
+        score += 8
+    elif wc >= 300:
+        score += 3
+
+    kd = data.get("keyword_density", 0)
+    if 0.3 <= kd <= 3.5:
+        score += 5
+    elif kd > 0:
+        score += 2
+
+    # 2. On-Page SEO (20pts)
+    if data.get("keyword_in_title"):
+        score += 7
+    if data.get("keyword_in_h1"):
+        score += 7
+    if data.get("keyword_in_meta"):
+        score += 6
+
+    # 3. Structure (15pts)
+    if data.get("h1_count", 0) >= 1:
+        score += 5
+    h2 = data.get("h2_count", 0)
+    if h2 >= 8:
+        score += 6
+    elif h2 >= 4:
+        score += 4
+    elif h2 >= 2:
+        score += 2
+    h3 = data.get("h3_count", 0)
+    if h3 >= 4:
+        score += 4
+    elif h3 >= 2:
+        score += 2
+
+    # 4. Technical SEO (20pts)
+    if data.get("canonical"):
+        score += 8
+    og = data.get("og_tags", {})
+    if og.get("og:title") and og.get("og:description"):
+        score += 7
+
+    speed = data.get("load_speed")
+    if isinstance(speed, dict):
+        mob = speed.get("mobile", {})
+        if isinstance(mob, dict):
+            ms = mob.get("score", 0)
+            if isinstance(ms, int):
+                if ms >= 90:
+                    score += 5
+                elif ms >= 60:
+                    score += 3
+                elif ms >= 30:
+                    score += 1
+
+    # 5. Content Quality (10pts)
+    r = data.get("readability", "Unknown")
+    score += {"Easy": 10, "Moderate": 6, "Hard": 2}.get(r, 0)
+
+    # 6. Media & Schema (10pts)
+    imgs = data.get("image_count", 0)
+    if imgs >= 5:
+        score += 5
+    elif imgs >= 2:
+        score += 3
+    elif imgs >= 1:
+        score += 1
+
+    if data.get("schema_types"):
+        score += 5
+
+    return min(score, 100)
+
+
+def compute_comparison(results: list, user_url: str, keyword: str) -> dict:
+    user = next((r for r in results if r.get("is_user")), None)
+    competitors = [r for r in results if not r.get("is_user") and r.get("page_status", 0) == 200]
+
+    if not user or not competitors:
+        return {"gaps": [], "competitor_averages": {}, "user_score": 0, "competitor_avg_score": 0}
+
+    def avg(key):
+        vals = [r.get(key, 0) for r in competitors
+                if isinstance(r.get(key), (int, float)) and r.get(key, 0) > 0]
+        return round(sum(vals) / len(vals), 1) if vals else 0
+
+    comp_avg = {
+        "word_count": avg("word_count"),
+        "h2_count": avg("h2_count"),
+        "h3_count": avg("h3_count"),
+        "keyword_count": avg("keyword_count"),
+        "internal_links": avg("internal_links"),
+        "image_count": avg("image_count"),
+        "seo_score": avg("seo_score"),
+    }
+
+    gaps = []
+
+    # Word count
+    wc_diff = user["word_count"] - comp_avg["word_count"]
+    if wc_diff < -300:
+        gaps.append({
+            "type": "content",
+            "severity": "high" if wc_diff < -1000 else "medium",
+            "metric": "Word Count",
+            "user_val": str(user["word_count"]),
+            "comp_avg": str(int(comp_avg["word_count"])),
+            "message": f"Your page has {abs(int(wc_diff)):,} fewer words than the competitor average ({int(comp_avg['word_count']):,} words). Expand your content to match their depth."
+        })
+
+    # H2 headings
+    h2_diff = user["h2_count"] - comp_avg["h2_count"]
+    if h2_diff < -3:
+        gaps.append({
+            "type": "structure",
+            "severity": "medium",
+            "metric": "H2 Headings",
+            "user_val": str(user["h2_count"]),
+            "comp_avg": str(int(comp_avg["h2_count"])),
+            "message": f"Your page has {abs(int(h2_diff))} fewer H2 headings than competitors (avg: {int(comp_avg['h2_count'])}). Add more section headings to improve structure and keyword coverage."
+        })
+
+    # Keyword in title
+    kw_title_count = sum(1 for c in competitors if c.get("keyword_in_title"))
+    if not user.get("keyword_in_title") and kw_title_count >= len(competitors) / 2:
+        gaps.append({
+            "type": "keyword",
+            "severity": "high",
+            "metric": "Keyword in Title",
+            "user_val": "Missing",
+            "comp_avg": f"{kw_title_count}/{len(competitors)} competitors",
+            "message": f"Primary keyword '{keyword}' is missing from your page title — {kw_title_count} of {len(competitors)} competitors include it. This is one of the highest-impact on-page SEO signals."
+        })
+
+    # Keyword in H1
+    if not user.get("keyword_in_h1"):
+        kw_h1_count = sum(1 for c in competitors if c.get("keyword_in_h1"))
+        if kw_h1_count >= 1:
+            gaps.append({
+                "type": "keyword",
+                "severity": "high",
+                "metric": "Keyword in H1",
+                "user_val": "Missing",
+                "comp_avg": f"{kw_h1_count}/{len(competitors)} competitors",
+                "message": f"Primary keyword missing from H1 — {kw_h1_count} competitors include it in their main heading. Your H1 is your strongest on-page signal."
+            })
+
+    # Keyword in meta
+    if not user.get("keyword_in_meta"):
+        kw_meta_count = sum(1 for c in competitors if c.get("keyword_in_meta"))
+        if kw_meta_count >= len(competitors) / 2:
+            gaps.append({
+                "type": "keyword",
+                "severity": "medium",
+                "metric": "Keyword in Meta Description",
+                "user_val": "Missing",
+                "comp_avg": f"{kw_meta_count}/{len(competitors)} competitors",
+                "message": f"Primary keyword missing from meta description — affects click-through rates from search results. {kw_meta_count} competitors include it."
+            })
+
+    # Keyword density
+    kd = user.get("keyword_density", 0)
+    if kd < 0.3:
+        gaps.append({
+            "type": "keyword",
+            "severity": "medium",
+            "metric": "Keyword Density",
+            "user_val": f"{kd:.2f}%",
+            "comp_avg": "0.5–2%",
+            "message": f"Keyword density is very low ({kd:.2f}%). Use your primary keyword more naturally throughout the content — aim for 0.5–2% density."
+        })
+
+    # Canonical
+    if not user.get("canonical"):
+        gaps.append({
+            "type": "technical",
+            "severity": "medium",
+            "metric": "Canonical Tag",
+            "user_val": "Missing",
+            "comp_avg": "Present",
+            "message": "No canonical tag detected — add a self-referential canonical to prevent duplicate content indexing fragmentation."
+        })
+
+    # Schema
+    if not user.get("schema_types"):
+        comp_schema_count = sum(1 for c in competitors if c.get("schema_types"))
+        if comp_schema_count >= 1:
+            gaps.append({
+                "type": "technical",
+                "severity": "low",
+                "metric": "Schema Markup",
+                "user_val": "None",
+                "comp_avg": f"{comp_schema_count}/{len(competitors)} competitors use schema",
+                "message": "No structured data found. Adding schema (Article, FAQ, Breadcrumb) can improve rich snippets and click-through rates."
+            })
+
+    # OG tags
+    if not user.get("og_complete"):
+        gaps.append({
+            "type": "technical",
+            "severity": "low",
+            "metric": "Open Graph Tags",
+            "user_val": "Incomplete",
+            "comp_avg": "Complete",
+            "message": "Open Graph tags (og:title, og:description, og:image) are missing or incomplete — critical for social sharing appearance."
+        })
+
+    # Internal links
+    il_diff = user["internal_links"] - comp_avg["internal_links"]
+    if il_diff < -10 and comp_avg["internal_links"] > 5:
+        gaps.append({
+            "type": "structure",
+            "severity": "medium",
+            "metric": "Internal Links",
+            "user_val": str(user["internal_links"]),
+            "comp_avg": str(int(comp_avg["internal_links"])),
+            "message": f"Your page has {abs(int(il_diff))} fewer internal links than competitors. Add contextual internal links to distribute link equity and improve crawlability."
+        })
+
+    # Images
+    img_diff = user["image_count"] - comp_avg["image_count"]
+    if img_diff < -3 and comp_avg["image_count"] > 2:
+        gaps.append({
+            "type": "content",
+            "severity": "low",
+            "metric": "Images / Media",
+            "user_val": str(user["image_count"]),
+            "comp_avg": str(int(comp_avg["image_count"])),
+            "message": f"Your page has {abs(int(img_diff))} fewer images than competitors. Add relevant visuals to improve engagement and time-on-page."
+        })
+
+    # Speed
+    speed = user.get("load_speed", {})
+    if isinstance(speed, dict):
+        mob = speed.get("mobile", {})
+        if isinstance(mob, dict):
+            mob_score = mob.get("score", "--")
+            if isinstance(mob_score, int) and mob_score < 50:
+                gaps.append({
+                    "type": "speed",
+                    "severity": "high",
+                    "metric": "Page Speed (Mobile)",
+                    "user_val": f"{mob_score}/100",
+                    "comp_avg": "Check competitors",
+                    "message": f"Mobile speed score is {mob_score}/100 — critically slow. 53% of users abandon sites that take more than 3 seconds to load. Fix immediately."
+                })
+
+    # Sort by severity
+    order = {"high": 0, "medium": 1, "low": 2}
+    gaps.sort(key=lambda g: order.get(g["severity"], 3))
+
+    # Content type match
+    user_type = user.get("content_type", "Unknown")
+    comp_types = [c.get("content_type", "Unknown") for c in competitors]
+    most_common = Counter(comp_types).most_common(1)[0][0] if comp_types else "Unknown"
+    content_type_note = None
+    if user_type != most_common and most_common != "Unknown":
+        content_type_note = f"Most top competitors use '{most_common}' format, but your page is '{user_type}'. Consider restructuring to match the dominant SERP format."
+
+    # Freshness note
+    freshness_note = None
+    comp_dates = [c.get("published_date") for c in competitors if c.get("published_date") not in ("Not Found", None, "")]
+    if comp_dates:
+        recent_dates = [d for d in comp_dates if d > "2024"]
+        if recent_dates and user.get("published_date", "Not Found") == "Not Found":
+            freshness_note = f"{len(recent_dates)} of {len(competitors)} competitors have recently updated content. Add date schema and refresh your content to signal freshness to Google."
+
+    return {
+        "user_score": user.get("seo_score", 0),
+        "competitor_avg_score": round(comp_avg["seo_score"], 0),
+        "competitor_averages": comp_avg,
+        "gaps": gaps,
+        "keyword": keyword,
+        "content_type_note": content_type_note,
+        "freshness_note": freshness_note,
+        "user_url": user_url,
+    }
+
+
+# ─────────────────────────────────────────────
+# PAGESPEED
+# ─────────────────────────────────────────────
+
+async def run_pagespeed_full(url: str) -> dict:
+    key = os.environ.get("PAGESPEED_API_KEY", "").strip()
+    empty = {"score": "--", "fcp": "--", "lcp": "--", "tbt": "--", "cls": "--", "si": "--", "rating": "N/A"}
+
+    if not key:
+        return {"mobile": dict(empty), "desktop": dict(empty)}
+
+    def get_metric(audits, audit_key, unit="s"):
+        item = audits.get(audit_key, {})
+        if "displayValue" in item:
+            return item["displayValue"]
+        if "numericValue" in item:
+            val = item["numericValue"]
+            if unit == "ms":
+                return f"{int(val)} ms"
+            return f"{val / 1000:.2f} s"
+        return "--"
+
+    def rating(score):
+        if not isinstance(score, int):
+            return "N/A"
+        if score >= 90:
+            return "Fast"
+        if score >= 50:
+            return "Moderate"
+        return "Slow"
+
+    async def fetch_strategy(strategy):
+        try:
+            api_url = (
+                f"https://www.googleapis.com/pagespeedonline/v5/runPagespeed"
+                f"?url={url}&strategy={strategy}&category=performance&key={key}"
+            )
+            async with aiohttp.ClientSession() as sess:
+                async with sess.get(api_url, timeout=aiohttp.ClientTimeout(total=60)) as resp:
+                    data = await resp.json()
+                    if "error" in data or "lighthouseResult" not in data:
+                        return None
+                    lh = data["lighthouseResult"]
+                    audits = lh["audits"]
+                    perf_score = lh["categories"]["performance"]["score"]
+                    score = int(perf_score * 100) if perf_score is not None else 0
+                    return {
+                        "score": score,
+                        "fcp": get_metric(audits, "first-contentful-paint"),
+                        "lcp": get_metric(audits, "largest-contentful-paint"),
+                        "tbt": get_metric(audits, "total-blocking-time", "ms"),
+                        "cls": get_metric(audits, "cumulative-layout-shift", ""),
+                        "si": get_metric(audits, "speed-index"),
+                        "rating": rating(score),
+                    }
+        except Exception:
+            return None
+
+    try:
+        mob, desk = await asyncio.gather(
+            fetch_strategy("mobile"), fetch_strategy("desktop"), return_exceptions=True
         )
-        # Cash outflow
-        db.add_transaction(user, "asset_purchase", asset_type,
-                           f"Bought {asset_type}", amount, data.get("date", today))
-        return {"type": "asset_created", "record": record}
+    except Exception:
+        mob, desk = None, None
 
-    elif action_type == "create_recurring":
-        record = db.add_recurring(
-            user_id=user,
-            name=data.get("name", "Recurring Payment"),
-            category=data.get("category", "other"),
-            amount=float(data.get("amount", 0)),
-            frequency=data.get("frequency", "monthly"),
+    if isinstance(mob, Exception) or mob is None:
+        mob = dict(empty)
+    if isinstance(desk, Exception) or desk is None:
+        desk = dict(empty)
+
+    return {"mobile": mob, "desktop": desk}
+
+
+# ─────────────────────────────────────────────
+# PAGE EXTRACTOR
+# ─────────────────────────────────────────────
+
+async def extract_full_page(session, url: str, keyword: str, manual: dict) -> dict:
+    kw = keyword.lower().strip()
+    result = {
+        "url": url, "page_status": 0,
+        "title": "", "title_length": 0,
+        "meta_description": "", "meta_desc_length": 0,
+        "h1": "", "h1_count": 0, "h2_count": 0, "h3_count": 0,
+        "keyword_in_title": False, "keyword_in_h1": False,
+        "keyword_in_meta": False, "keyword_in_h2": False, "keyword_in_h3": False,
+        "keyword_count": 0, "keyword_density": 0.0, "keyword_variations": [],
+        "word_count": 0, "intent": "Unknown", "content_type": "Unknown",
+        "published_date": "Not Found", "readability": "Unknown",
+        "schema_types": [], "internal_links": 0, "external_links": 0,
+        "image_count": 0, "canonical": None, "canonical_match": False,
+        "og_tags": {}, "og_complete": False,
+        "load_speed": None, "seo_score": 0,
+        "da": manual.get("da", "Not Provided"),
+        "pa": manual.get("pa", "Not Provided"),
+        "backlinks": manual.get("backlinks", "Not Provided"),
+        "plagiarism": manual.get("plagiarism", "Not Provided"),
+    }
+
+    try:
+        async with session.get(
+            url, timeout=aiohttp.ClientTimeout(total=20),
+            ssl=False, headers=HEADERS, allow_redirects=True
+        ) as resp:
+            result["page_status"] = resp.status
+            if resp.status != 200:
+                return result
+            text = await resp.text(errors="ignore")
+
+        soup = BeautifulSoup(text, "html.parser")
+        page_domain = urlparse(url).netloc
+
+        # Title
+        title_tag = soup.find("title")
+        title = title_tag.get_text(strip=True) if title_tag else ""
+        result["title"] = title[:250]
+        result["title_length"] = len(title)
+        result["keyword_in_title"] = kw in title.lower()
+
+        # Meta description
+        meta_desc_tag = soup.find("meta", attrs={"name": re.compile(r"^description$", re.I)})
+        desc = meta_desc_tag.get("content", "").strip() if meta_desc_tag else ""
+        result["meta_description"] = desc[:350]
+        result["meta_desc_length"] = len(desc)
+        result["keyword_in_meta"] = kw in desc.lower()
+
+        # Headings
+        h1_tags = soup.find_all("h1")
+        result["h1_count"] = len(h1_tags)
+        result["h1"] = h1_tags[0].get_text(strip=True)[:200] if h1_tags else ""
+        result["keyword_in_h1"] = kw in result["h1"].lower()
+
+        h2_tags = soup.find_all("h2")
+        result["h2_count"] = len(h2_tags)
+        h2_text = " ".join(h.get_text(strip=True).lower() for h in h2_tags)
+        result["keyword_in_h2"] = kw in h2_text
+
+        h3_tags = soup.find_all("h3")
+        result["h3_count"] = len(h3_tags)
+        h3_text = " ".join(h.get_text(strip=True).lower() for h in h3_tags)
+        result["keyword_in_h3"] = kw in h3_text
+
+        # Clean content
+        for tag in soup.find_all(["script", "style", "noscript", "nav", "header", "footer", "aside"]):
+            tag.decompose()
+        clean_text = soup.get_text(" ", strip=True)
+        words = clean_text.lower().split()
+        result["word_count"] = len(words)
+
+        # Keyword count & density
+        kw_parts = kw.split()
+        kw_count = sum(
+            1 for i in range(len(words) - len(kw_parts) + 1)
+            if words[i:i + len(kw_parts)] == kw_parts
         )
-        return {"type": "recurring_created", "record": record}
+        result["keyword_count"] = kw_count
+        result["keyword_density"] = round((kw_count / max(len(words), 1)) * 100, 2)
+        result["keyword_variations"] = extract_keyword_variations(clean_text, keyword)
 
-    elif action_type == "create_savings_goal":
-        record = db.add_savings_goal(
-            user_id=user,
-            goal_name=data.get("goal_name", "Savings Goal"),
-            target_amount=float(data.get("target_amount", data.get("current_amount", 0))),
-            current_amount=float(data.get("current_amount", 0)),
-            target_date=data.get("target_date"),
-        )
-        return {"type": "savings_goal_created", "record": record}
+        # Metadata
+        result["intent"] = detect_intent(url, title, result["h1"])
+        result["content_type"] = detect_content_type(result["h2_count"], result["word_count"], title, result["h1"])
+        result["readability"] = compute_readability(clean_text)
+        result["published_date"] = extract_date(soup)
+        result["schema_types"] = detect_schema(soup)
 
-    elif action_type == "create_debt":
-        record = db.add_debt(
-            user_id=user,
-            debt_type=data.get("debt_type", "personal"),
-            creditor=data.get("creditor", "Unknown"),
-            principal=float(data.get("principal", data.get("amount", 0))),
-            interest_rate=float(data.get("interest_rate", 0)),
-            emi=float(data.get("emi", 0)),
-            due_date=data.get("due_date"),
-        )
-        return {"type": "debt_created", "record": record}
+        # Links
+        for a in soup.find_all("a", href=True):
+            href = urljoin(url, a["href"])
+            if not href.startswith("http"):
+                continue
+            if urlparse(href).netloc == page_domain:
+                result["internal_links"] += 1
+            else:
+                result["external_links"] += 1
 
-    elif action_type == "update_prices":
-        asset_type = data.get("asset_type", "gold")
-        price = float(data.get("price_per_unit", 0))
-        if price > 0:
-            symbol = "GOLD_INR_GRAM" if asset_type == "gold" else "SILVER_INR_GRAM"
-            db.upsert_market_price(symbol, "commodity", price)
-            db.update_asset_values_by_type(user, asset_type, price)
-        return {"type": "prices_updated", "asset_type": asset_type, "price": price}
+        # Images
+        result["image_count"] = len(soup.find_all("img"))
 
-    elif action_type == "query_data":
-        return {"type": "query", "data": db.compute_financial_summary(user)}
+        # Canonical
+        can_tag = soup.find("link", rel="canonical")
+        if can_tag and can_tag.get("href"):
+            result["canonical"] = can_tag["href"].strip()
+            result["canonical_match"] = normalize_url(can_tag["href"].strip()) == normalize_url(url)
 
-    return {"type": "unknown", "action": action_type}
+        # OG tags
+        og_props = ["og:title", "og:description", "og:image", "og:type", "og:url"]
+        og = {}
+        for prop in og_props:
+            m = soup.find("meta", property=prop)
+            if m and m.get("content"):
+                og[prop] = m["content"][:300]
+        result["og_tags"] = og
+        result["og_complete"] = bool(og.get("og:title") and og.get("og:description") and og.get("og:image"))
 
+        # PageSpeed
+        result["load_speed"] = await run_pagespeed_full(url)
 
-async def _generate_notifications(user: str, executed: list):
-    """Generate smart notifications after financial actions."""
-    for action in executed:
-        action_type = action.get("type")
-        if action_type == "expense_created":
-            rec = action.get("record", {})
-            if rec.get("amount", 0) > 5000:
-                db.add_notification(user, "alert", "Large Expense",
-                    f"₹{rec.get('amount', 0):,.0f} spent on {rec.get('category', 'other')}. Review if expected.")
-        elif action_type == "sip_created":
-            sip = action.get("sip", {})
-            db.add_notification(user, "info", "SIP Scheduled",
-                f"SIP of ₹{sip.get('amount', 0):,.0f}/month set up for {sip.get('fund_name')}.")
-        elif action_type == "debt_created":
-            rec = action.get("record", {})
-            db.add_notification(user, "warning", "Debt Recorded",
-                f"Debt of ₹{rec.get('principal', 0):,.0f} from {rec.get('creditor')} recorded. Plan repayment.")
+        # SEO Score (after speed is fetched)
+        result["seo_score"] = compute_seo_score(result, keyword)
+
+    except Exception:
+        pass
+
+    return result
 
 
-# ── FINANCIAL DATA ENDPOINTS ────────────────────────────────────────────────────
+# ─────────────────────────────────────────────
+# ENDPOINT
+# ─────────────────────────────────────────────
 
-@app.get("/api/summary")
-def get_summary(x_user: Optional[str] = Header(None)):
-    user = get_user(x_user)
-    summary = db.compute_financial_summary(user)
-    health = ai.compute_health_score(db.get_full_user_data(user))
-    return {**summary, "health_score": health}
+@app.post("/serp-compare")
+async def serp_compare(request: CompareRequest):
+    keyword = request.keyword.strip()
+    if not keyword:
+        return {"error": "keyword is required"}
 
-@app.get("/api/dashboard")
-def get_dashboard(x_user: Optional[str] = Header(None)):
-    user = get_user(x_user)
-    user_data = db.get_full_user_data(user)
-    summary = user_data.get("summary", {})
-    health = ai.compute_health_score(user_data)
-    insights = ai.generate_insights(user_data)
-    predictions = ai.generate_predictions(user_data)
+    def clean_url(u):
+        u = u.strip()
+        if not u.startswith("http"):
+            u = "https://" + u
+        return normalize_url(u)
 
-    # Recent transactions (last 10)
-    recent = db.get_transactions(user, limit=10)
+    user_url = clean_url(request.user_url)
+    competitor_urls = [clean_url(u) for u in request.competitor_urls if u.strip()]
+    all_urls = [user_url] + competitor_urls
+    manual_data = request.manual_data or {}
 
-    # Upcoming payments (next 30 days)
-    today = date.today()
-    next_month = (today + timedelta(days=30)).isoformat()
-    upcoming = [r for r in db.get_recurring(user) if r.get("next_due", "") <= next_month]
+    async def generator():
+        all_results = []
+        connector = aiohttp.TCPConnector(limit=20, ssl=False)
 
-    # Category breakdown (last 30 days)
-    since = (today - timedelta(days=30)).isoformat()
-    recent_expenses = db.get_transactions(user, tx_type="expense", since_date=since)
-    cat_breakdown = {}
-    for e in recent_expenses:
-        cat = e.get("category", "other")
-        cat_breakdown[cat] = cat_breakdown.get(cat, 0) + e.get("amount", 0)
+        async with aiohttp.ClientSession(headers=HEADERS, connector=connector) as session:
 
-    # Market data
-    market_data = db.get_all_market_data()
+            async def process(idx, url):
+                data = await extract_full_page(session, url, keyword, manual_data.get(url, {}))
+                data["is_user"] = idx == 0
+                data["rank"] = "Your Page" if idx == 0 else f"#{idx}"
+                data["_idx"] = idx
+                return data
 
-    return {
-        "summary": summary,
-        "health": health,
-        "insights": insights,
-        "recent_transactions": recent,
-        "upcoming_payments": upcoming[:5],
-        "category_breakdown": cat_breakdown,
-        "expense_forecast": predictions.get("expense_forecast", [])[:3],
-        "investment_projection": predictions.get("investment_projection", [])[:3],
-        "market_data": market_data,
-        "notifications": db.get_notifications(user, unread_only=True)[:5],
-    }
+            tasks = [asyncio.create_task(process(i, u)) for i, u in enumerate(all_urls)]
 
-@app.get("/api/transactions")
-def get_transactions(tx_type: Optional[str] = None, limit: int = 100,
-                     x_user: Optional[str] = Header(None)):
-    user = get_user(x_user)
-    return {"items": db.get_transactions(user, tx_type=tx_type, limit=limit)}
+            for coro in asyncio.as_completed(tasks):
+                result = await coro
+                all_results.append(result)
+                yield json.dumps({"type": "page_result", "data": result}) + "\n"
 
-@app.delete("/api/transactions/{tx_id}")
-def delete_transaction(tx_id: str, x_user: Optional[str] = Header(None)):
-    user = get_user(x_user)
-    db.delete_transaction(user, tx_id)
-    return {"success": True}
+            # Sort results back into original order for comparison
+            all_results.sort(key=lambda r: r.get("_idx", 99))
+            comparison = compute_comparison(all_results, user_url, keyword)
+            yield json.dumps({"type": "comparison", "data": comparison}) + "\n"
+            yield json.dumps({"type": "done"}) + "\n"
 
-@app.get("/api/investments")
-def get_investments(x_user: Optional[str] = Header(None)):
-    user = get_user(x_user)
-    investments = db.get_investments(user)
-    total_invested = sum(i.get("invested_amount", 0) for i in investments)
-    total_current = sum(i.get("current_value") or i.get("invested_amount", 0) for i in investments)
-    return {
-        "items": investments,
-        "total_invested": total_invested,
-        "total_current_value": total_current,
-        "total_gain": total_current - total_invested,
-        "gain_pct": ((total_current - total_invested) / total_invested * 100) if total_invested > 0 else 0,
-    }
+    return StreamingResponse(generator(), media_type="application/x-ndjson")
 
-@app.delete("/api/investments/{inv_id}")
-def delete_investment(inv_id: str, x_user: Optional[str] = Header(None)):
-    user = get_user(x_user)
-    db.delete_investment(user, inv_id)
-    return {"success": True}
 
-@app.get("/api/sips")
-def get_sips(x_user: Optional[str] = Header(None)):
-    user = get_user(x_user)
-    sips = db.get_sips(user)
-    return {"items": sips, "total_monthly": sum(s.get("amount", 0) for s in sips if s.get("is_active"))}
-
-@app.post("/api/sips/{sip_id}/pay")
-def pay_sip(sip_id: str, x_user: Optional[str] = Header(None)):
-    user = get_user(x_user)
-    sip = db.mark_sip_paid(user, sip_id)
-    if not sip:
-        raise HTTPException(404, "SIP not found")
-    # Record transaction
-    db.add_transaction(user, "investment", "mutual_fund",
-                       f"SIP payment: {sip.get('fund_name')}", sip.get("amount", 0), date.today().isoformat())
-    return {"success": True, "sip": sip}
-
-@app.get("/api/assets")
-def get_assets(x_user: Optional[str] = Header(None)):
-    user = get_user(x_user)
-    assets = db.get_assets(user)
-    total_cost = sum(a.get("purchase_price", 0) for a in assets)
-    total_value = sum(a.get("current_value") or a.get("purchase_price", 0) for a in assets)
-    return {
-        "items": assets,
-        "total_cost": total_cost,
-        "total_current_value": total_value,
-        "total_gain": total_value - total_cost,
-    }
-
-@app.delete("/api/assets/{asset_id}")
-def delete_asset(asset_id: str, x_user: Optional[str] = Header(None)):
-    user = get_user(x_user)
-    db.delete_asset(user, asset_id)
-    return {"success": True}
-
-@app.get("/api/recurring")
-def get_recurring(x_user: Optional[str] = Header(None)):
-    user = get_user(x_user)
-    items = db.get_recurring(user)
-    return {"items": items, "total_monthly": sum(r.get("amount", 0) for r in items if r.get("frequency") == "monthly")}
-
-@app.delete("/api/recurring/{rec_id}")
-def delete_recurring(rec_id: str, x_user: Optional[str] = Header(None)):
-    user = get_user(x_user)
-    db.delete_recurring(user, rec_id)
-    return {"success": True}
-
-@app.get("/api/savings")
-def get_savings(x_user: Optional[str] = Header(None)):
-    user = get_user(x_user)
-    goals = db.get_savings_goals(user)
-    return {"items": goals, "total": sum(g.get("current_amount", 0) for g in goals)}
-
-@app.delete("/api/savings/{goal_id}")
-def delete_savings(goal_id: str, x_user: Optional[str] = Header(None)):
-    user = get_user(x_user)
-    db.delete_savings_goal(user, goal_id)
-    return {"success": True}
-
-@app.get("/api/debts")
-def get_debts(x_user: Optional[str] = Header(None)):
-    user = get_user(x_user)
-    debts = db.get_debts(user)
-    return {"items": debts, "total_debt": sum(d.get("remaining") or d.get("principal", 0) for d in debts)}
-
-@app.get("/api/income")
-def get_income(x_user: Optional[str] = Header(None)):
-    user = get_user(x_user)
-    income = db.get_income(user)
-    return {"items": income, "total": sum(i.get("amount", 0) for i in income)}
-
-@app.get("/api/health-score")
-def get_health_score(x_user: Optional[str] = Header(None)):
-    user = get_user(x_user)
-    user_data = db.get_full_user_data(user)
-    return ai.compute_health_score(user_data)
-
-@app.get("/api/insights")
-def get_insights(x_user: Optional[str] = Header(None)):
-    user = get_user(x_user)
-    user_data = db.get_full_user_data(user)
-    return {
-        "insights": ai.generate_insights(user_data),
-        "stored": db.get_insights(user),
-    }
-
-@app.get("/api/predictions")
-def get_predictions(x_user: Optional[str] = Header(None)):
-    user = get_user(x_user)
-    user_data = db.get_full_user_data(user)
-    return ai.generate_predictions(user_data)
-
-@app.get("/api/analytics")
-def get_analytics(x_user: Optional[str] = Header(None)):
-    user = get_user(x_user)
-    user_data = db.get_full_user_data(user)
-    summary = user_data.get("summary", {})
-    predictions = ai.generate_predictions(user_data)
-    health = ai.compute_health_score(user_data)
-
-    # Monthly expense history
-    expense_history = predictions.get("expense_history", [])
-
-    # Category breakdown (all time)
-    all_expenses = db.get_transactions(user, tx_type="expense")
-    cat_breakdown = {}
-    for e in all_expenses:
-        cat = e.get("category", "other")
-        cat_breakdown[cat] = cat_breakdown.get(cat, 0) + e.get("amount", 0)
-
-    # Monthly investment trend
-    investments = db.get_investments(user)
-    inv_by_type = {}
-    for i in investments:
-        t = i.get("investment_type", "other")
-        inv_by_type[t] = inv_by_type.get(t, 0) + i.get("invested_amount", 0)
-
-    # Asset allocation
-    assets = db.get_assets(user)
-    asset_alloc = {}
-    for a in assets:
-        t = a.get("asset_type", "other")
-        asset_alloc[t] = asset_alloc.get(t, a.get("current_value", a.get("purchase_price", 0)))
-        asset_alloc[t] += a.get("current_value", a.get("purchase_price", 0))
-
-    return {
-        "summary": summary,
-        "health": health,
-        "expense_history": expense_history,
-        "expense_forecast": predictions.get("expense_forecast", []),
-        "category_breakdown": cat_breakdown,
-        "investment_by_type": inv_by_type,
-        "asset_allocation": asset_alloc,
-        "investment_projection": predictions.get("investment_projection", []),
-        "net_worth_forecast": predictions.get("net_worth_forecast", []),
-        "ai_recommendation": predictions.get("ai_recommendation", ""),
-    }
-
-# ── Market Data ────────────────────────────────────────────────────────────────
-@app.get("/api/market")
-async def get_market_data(x_user: Optional[str] = Header(None)):
-    user = get_user(x_user)
-    # Fetch fresh prices
-    prices = await market.fetch_all()
-    stored = db.get_all_market_data()
-    return {"prices": prices, "stored": stored}
-
-@app.post("/api/market/refresh")
-async def refresh_market(x_user: Optional[str] = Header(None)):
-    user = get_user(x_user)
-    prices = await market.fetch_all()
-    asset_result = await market.update_asset_values(db, user)
-    portfolio_result = await market.update_portfolio_values(db, user)
-    return {
-        "prices": prices,
-        "assets_updated": asset_result,
-        "portfolio_updated": portfolio_result,
-    }
-
-@app.post("/api/market/update")
-def update_market_manual(body: MarketUpdateBody, x_user: Optional[str] = Header(None)):
-    user = get_user(x_user)
-    db.upsert_market_price(body.symbol, body.asset_class, body.price)
-    return {"success": True, "symbol": body.symbol, "price": body.price}
-
-# ── Notifications ─────────────────────────────────────────────────────────────
-@app.get("/api/notifications")
-def get_notifications(x_user: Optional[str] = Header(None)):
-    user = get_user(x_user)
-    return {"items": db.get_notifications(user)}
-
-@app.post("/api/notifications/{notif_id}/read")
-def mark_notification_read(notif_id: str, x_user: Optional[str] = Header(None)):
-    user = get_user(x_user)
-    db.mark_notification_read(user, notif_id)
-    return {"success": True}
-
-# ── Generic collection endpoints (legacy compatibility) ───────────────────────
-COLLECTION_MAP = {
-    "expenses": lambda user, limit: db.get_transactions(user, tx_type="expense", limit=limit),
-    "investments": lambda user, limit: db.get_investments(user),
-    "assets": lambda user, limit: db.get_assets(user),
-    "recurring": lambda user, limit: db.get_recurring(user),
-    "debts": lambda user, limit: db.get_debts(user),
-    "savings": lambda user, limit: db.get_savings_goals(user),
-}
-
-@app.get("/api/{collection}")
-def get_collection(collection: str, x_user: Optional[str] = Header(None)):
-    user = get_user(x_user)
-    if collection not in COLLECTION_MAP:
-        raise HTTPException(404, f"Unknown collection: {collection}")
-    items = COLLECTION_MAP[collection](user, 200)
-    return {"items": items, "count": len(items)}
-
-@app.delete("/api/{collection}/{record_id}")
-def delete_from_collection(collection: str, record_id: str,
-                            x_user: Optional[str] = Header(None)):
-    user = get_user(x_user)
-    if collection == "expenses":
-        db.delete_transaction(user, record_id)
-    elif collection == "investments":
-        db.delete_investment(user, record_id)
-    elif collection == "assets":
-        db.delete_asset(user, record_id)
-    elif collection == "recurring":
-        db.delete_recurring(user, record_id)
-    elif collection == "savings":
-        db.delete_savings_goal(user, record_id)
-    else:
-        raise HTTPException(404)
-    return {"success": True}
+@app.get("/health")
+async def health():
+    return {"status": "ok", "service": "SearchRNK SERP Compare"}
 
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run("main:app", host="0.0.0.0", port=int(os.environ.get("PORT", 8000)), reload=True)
+    uvicorn.run(app, host="0.0.0.0", port=10000)
