@@ -379,12 +379,12 @@ async def _fetch_with_retry(url: str, max_attempts: int = 3) -> tuple:
       Attempt 1 — Firefox UA, unverified SSL, no Sec-Fetch headers, 1s delay
       Attempt 2 — Safari UA, legacy cipher ctx, 2s delay
     """
-    # Build three SSL contexts for escalating bypass
-    ctx_verified = ssl.create_default_context()
-
-    ctx_skip = ssl.create_default_context()
-    ctx_skip.check_hostname = False
-    ctx_skip.verify_mode    = ssl.CERT_NONE
+    # SSL contexts — start with no-verify (same as original ssl=False),
+    # only try stricter modes as fallback. This preserves the original
+    # behaviour for all sites that worked before.
+    ctx_nocheck = ssl.create_default_context()
+    ctx_nocheck.check_hostname = False
+    ctx_nocheck.verify_mode    = ssl.CERT_NONE
 
     ctx_legacy = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
     ctx_legacy.check_hostname = False
@@ -394,7 +394,10 @@ async def _fetch_with_retry(url: str, max_attempts: int = 3) -> tuple:
     except Exception:
         pass
 
-    ssl_ctxs = [ctx_verified, ctx_skip, ctx_legacy]
+    ctx_verified = ssl.create_default_context()   # only as last resort
+
+    # Order: permissive first (preserves original behaviour) → legacy ciphers → verified
+    ssl_ctxs = [ctx_nocheck, ctx_legacy, ctx_verified]
 
     last_status  = 0
     last_body    = b""
@@ -479,31 +482,7 @@ async def _fetch_with_retry(url: str, max_attempts: int = 3) -> tuple:
 # ═══════════════════════════════════════════════════════════════
 # PAGE EXTRACTOR  (uses robust fetch internally)
 # ═══════════════════════════════════════════════════════════════
-async def _fetch_with_cloudscraper(url: str) -> tuple:
-    """Cloudflare bypass using cloudscraper — runs in thread pool to avoid blocking."""
-    try:
-        import cloudscraper
-        import concurrent.futures
 
-        def _sync_fetch():
-            scraper = cloudscraper.create_scraper(
-                browser={"browser": "chrome", "platform": "windows", "mobile": False}
-            )
-            resp = scraper.get(url, timeout=25, allow_redirects=True)
-            return resp.status_code, resp.content
-
-        loop = asyncio.get_event_loop()
-        with concurrent.futures.ThreadPoolExecutor() as pool:
-            status, content = await loop.run_in_executor(pool, _sync_fetch)
-        if status == 200 and content:
-            return 200, content, None
-        return status, b"", f"Cloudscraper HTTP {status}"
-    except ImportError:
-        return 0, b"", "cloudscraper not installed"
-    except Exception as e:
-        return 0, b"", f"Cloudscraper error: {type(e).__name__}: {e}"
-      
-    
 async def extract_page(session, url: str, keyword: str, manual: dict) -> dict:
     """
     `session` kept for signature compatibility — actual HTTP is done by _fetch_with_retry.
@@ -536,21 +515,13 @@ async def extract_page(session, url: str, keyword: str, manual: dict) -> dict:
     status, raw, block_reason = await _fetch_with_retry(url, max_attempts=3)
     result["page_status"]   = status
     result["_block_reason"] = block_reason
-# ── Cloudscraper fallback for Cloudflare/connection-blocked sites ──
+
     if status != 200 or not raw:
-        cs_status, cs_raw, cs_err = await _fetch_with_cloudscraper(url)
-        if cs_status == 200 and cs_raw:
-            status = cs_status
-            raw    = cs_raw
-            result["_crawl_note"] = "✅ Fetched via Cloudflare bypass (cloudscraper)"
-        else:
-            result["_crawl_note"] = (
-                f"❌ Both methods failed. Direct: {block_reason or 'no response'}. "
-                f"Cloudscraper: {cs_err or 'failed'}"
-            )
-            result["page_status"] = status
-            return result
-  
+        result["_crawl_note"] = (
+            block_reason or
+            (f"HTTP {status} — could not fetch page" if status else "No response received")
+        )
+        return result
 
     # ── Decode ───────────────────────────────────────────────────
     try:
@@ -1076,6 +1047,7 @@ async def health():
         "llama_requests_used":    _ai_state["llama_requests_used"],
         "date":                   _ai_state["date"],
     }
+
 
 if __name__ == "__main__":
     import uvicorn
