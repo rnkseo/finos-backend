@@ -376,24 +376,49 @@ async def extract_page(session, url: str, keyword: str, manual: dict) -> dict:
             result["page_status"] = resp.status
             text = await resp.text(errors="ignore")
 
-        # ── ADDED: if blocked, retry with fallback UAs (2 attempts) ──────────
-        # Sites that work normally skip this block entirely.
+        # ── ADDED: bot-challenge handling + Google Cache fallback ───────────
+        # Sites that work normally skip this entire block.
         if _is_blocked(result["page_status"], text, _raw_title(text)):
+
+            # Step 1 — retry with 2 fallback User-Agents
             for fb_headers in _FALLBACK_HEADERS:
-                await asyncio.sleep(random.uniform(1.5, 3.0))
+                await asyncio.sleep(random.uniform(1.0, 2.0))
                 try:
                     async with session.get(url, timeout=aiohttp.ClientTimeout(total=25), ssl=False,
                                            headers=fb_headers, allow_redirects=True) as resp2:
                         result["page_status"] = resp2.status
                         candidate = await resp2.text(errors="ignore")
                         if not _is_blocked(resp2.status, candidate, _raw_title(candidate)):
-                            text = candidate   # got real content
+                            text = candidate
                             break
                 except Exception:
                     continue
-        # ── If still blocked after retries, return early ──────────────────────
+
+            # Step 2 — if still blocked, try Google Cache (free, no API key needed)
+            if _is_blocked(result["page_status"], text, _raw_title(text)):
+                cache_url = f"https://webcache.googleusercontent.com/search?q=cache:{url}&hl=en"
+                try:
+                    cache_headers = {
+                        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124.0.0.0 Safari/537.36",
+                        "Accept": "text/html,application/xhtml+xml,*/*;q=0.8",
+                        "Accept-Language": "en-US,en;q=0.9",
+                        "Referer": "https://www.google.com/",
+                    }
+                    async with session.get(cache_url, timeout=aiohttp.ClientTimeout(total=20),
+                                           ssl=False, headers=cache_headers,
+                                           allow_redirects=True) as cr:
+                        if cr.status == 200:
+                            cached = await cr.text(errors="ignore")
+                            if not _is_blocked(cr.status, cached, _raw_title(cached)) and len(cached) > 2000:
+                                text = cached
+                                result["page_status"] = 200
+                                result["_crawl_note"] = "Data sourced from Google Cache (site blocked direct access)"
+                except Exception:
+                    pass
+
+        # ── If still blocked after all attempts, return clean empty result ────
         if result["page_status"] != 200 or _is_blocked(result["page_status"], text, _raw_title(text)):
-            result["_block_reason"] = "Bot protection active — page returned a challenge instead of content"
+            result["_block_reason"] = "Bot protection active — could not retrieve real page content"
             return result
         # ─────────────────────────────────────────────────────────────────────
 
