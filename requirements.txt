@@ -6,3 +6,4 @@ lxml==5.2.2
 pydantic==2.7.1
 playwright
 greenlet
+cloudscraper
