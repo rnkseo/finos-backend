@@ -55,13 +55,27 @@ _BLOCK_PATTERNS = [
     "captcha", "robot", "bot detection", "access denied",
     "are you human", "security check", "cf-browser-verification",
     "challenge-platform", "ray id",
+    # Additional Cloudflare / anti-bot variants
+    "verifying your connection", "verifying you are human",
+    "attention required", "one more step", "please turn javascript on",
+    "browser check", "human verification", "site protection",
+    "403 forbidden", "access to this page has been denied",
+    "performance & security by", "please complete the security check",
 ]
 
-def _is_blocked(status: int, body: str) -> bool:
+def _is_blocked(status: int, body: str, title: str = "") -> bool:
     if status in (403, 429, 503):
         return True
     snippet = body[:3000].lower()
+    # Any single pattern match in the title is an immediate block signal
+    title_lower = title.lower()
+    if any(p in title_lower for p in _BLOCK_PATTERNS):
+        return True
     return sum(1 for p in _BLOCK_PATTERNS if p in snippet) >= 2
+def _raw_title(html: str) -> str:
+    m = re.search(r"<title[^>]*>(.*?)</title>", html, re.I | re.S)
+    return m.group(1).strip() if m else ""
+
 # ═══════════════════════════════════════════
 
 # ═══════════════════════════════════════════
@@ -364,7 +378,7 @@ async def extract_page(session, url: str, keyword: str, manual: dict) -> dict:
 
         # ── ADDED: if blocked, retry with fallback UAs (2 attempts) ──────────
         # Sites that work normally skip this block entirely.
-        if _is_blocked(result["page_status"], text):
+        if _is_blocked(result["page_status"], text, _raw_title(text)):
             for fb_headers in _FALLBACK_HEADERS:
                 await asyncio.sleep(random.uniform(1.5, 3.0))
                 try:
@@ -372,13 +386,13 @@ async def extract_page(session, url: str, keyword: str, manual: dict) -> dict:
                                            headers=fb_headers, allow_redirects=True) as resp2:
                         result["page_status"] = resp2.status
                         candidate = await resp2.text(errors="ignore")
-                        if not _is_blocked(resp2.status, candidate):
+                        if not _is_blocked(resp2.status, candidate, _raw_title(candidate)):
                             text = candidate   # got real content
                             break
                 except Exception:
                     continue
         # ── If still blocked after retries, return early ──────────────────────
-        if result["page_status"] != 200 or _is_blocked(result["page_status"], text):
+        if result["page_status"] != 200 or _is_blocked(result["page_status"], text, _raw_title(text)):
             result["_block_reason"] = "Bot protection active — page returned a challenge instead of content"
             return result
         # ─────────────────────────────────────────────────────────────────────
