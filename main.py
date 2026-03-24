@@ -503,38 +503,7 @@ async def _fetch_with_cloudscraper(url: str) -> tuple:
     except Exception as e:
         return 0, b"", f"Cloudscraper error: {type(e).__name__}: {e}"
       
-    if status != 200 or not raw:
-    try:
-        from playwright.async_api import async_playwright
-        async with async_playwright() as p:
-            browser = await p.chromium.launch(
-                headless=True,
-                args=["--no-sandbox","--disable-setuid-sandbox",
-                      "--disable-blink-features=AutomationControlled"]
-            )
-            ctx = await browser.new_context(
-                user_agent=_UA_POOL[0],
-                viewport={"width":1280,"height":800},
-                extra_http_headers={"Accept-Language":"en-US,en;q=0.9"},
-            )
-            page = await ctx.new_page()
-            await page.add_init_script(
-                "Object.defineProperty(navigator,'webdriver',{get:()=>undefined})"
-            )
-            try:
-                await page.goto(url, wait_until="networkidle", timeout=25000)
-                await asyncio.sleep(1.5)
-                html = await page.content()
-                await browser.close()
-                return 200, html.encode("utf-8", errors="replace"), None
-            except Exception as e:
-                await browser.close()
-                return 0, b"", f"Playwright navigation failed: {e}"
-    except ImportError:
-        return 0, b"", "Playwright not installed"
-    except Exception as e:
-        return 0, b"", f"Playwright error: {e}"
-
+    
 async def extract_page(session, url: str, keyword: str, manual: dict) -> dict:
     """
     `session` kept for signature compatibility — actual HTTP is done by _fetch_with_retry.
@@ -581,21 +550,7 @@ async def extract_page(session, url: str, keyword: str, manual: dict) -> dict:
             )
             result["page_status"] = status
             return result
-    # ── JS-SPA Playwright fallback ────────────────────────────────
-    try:
-        _quick = BeautifulSoup(raw.decode("utf-8", errors="replace"), "html.parser").get_text()
-        _qwords = len(_quick.split())
-    except Exception:
-        _qwords = 999
-
-    if _qwords < 80:
-        pw_status, pw_raw, pw_err = await _fetch_with_playwright(url)
-        if pw_status == 200 and pw_raw:
-            raw = pw_raw
-            result["_crawl_note"] = "⚡ JS-rendered — used Playwright"
-        else:
-            result["_crawl_note"] = f"⚠️ JS page ({_qwords} words static). Playwright: {pw_err or 'failed'}"
-    
+  
 
     # ── Decode ───────────────────────────────────────────────────
     try:
@@ -1123,9 +1078,5 @@ async def health():
     }
 
 if __name__ == "__main__":
-    import uvicorn, subprocess
-    try:
-        subprocess.run(["playwright", "install", "chromium"], check=False)
-    except Exception:
-        pass
+    import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=10000)
