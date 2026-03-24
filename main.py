@@ -479,8 +479,31 @@ async def _fetch_with_retry(url: str, max_attempts: int = 3) -> tuple:
 # ═══════════════════════════════════════════════════════════════
 # PAGE EXTRACTOR  (uses robust fetch internally)
 # ═══════════════════════════════════════════════════════════════
+async def _fetch_with_cloudscraper(url: str) -> tuple:
+    """Cloudflare bypass using cloudscraper — runs in thread pool to avoid blocking."""
+    try:
+        import cloudscraper
+        import concurrent.futures
 
-async def _fetch_with_playwright(url: str) -> tuple:
+        def _sync_fetch():
+            scraper = cloudscraper.create_scraper(
+                browser={"browser": "chrome", "platform": "windows", "mobile": False}
+            )
+            resp = scraper.get(url, timeout=25, allow_redirects=True)
+            return resp.status_code, resp.content
+
+        loop = asyncio.get_event_loop()
+        with concurrent.futures.ThreadPoolExecutor() as pool:
+            status, content = await loop.run_in_executor(pool, _sync_fetch)
+        if status == 200 and content:
+            return 200, content, None
+        return status, b"", f"Cloudscraper HTTP {status}"
+    except ImportError:
+        return 0, b"", "cloudscraper not installed"
+    except Exception as e:
+        return 0, b"", f"Cloudscraper error: {type(e).__name__}: {e}"
+      
+    if status != 200 or not raw:
     try:
         from playwright.async_api import async_playwright
         async with async_playwright() as p:
@@ -544,13 +567,20 @@ async def extract_page(session, url: str, keyword: str, manual: dict) -> dict:
     status, raw, block_reason = await _fetch_with_retry(url, max_attempts=3)
     result["page_status"]   = status
     result["_block_reason"] = block_reason
- if status != 200 or not raw:
-        result["_crawl_note"] = (
-            block_reason or
-            (f"HTTP {status} — could not fetch page" if status else "No response received")
-        )
-        return result
-
+# ── Cloudscraper fallback for Cloudflare/connection-blocked sites ──
+    if status != 200 or not raw:
+        cs_status, cs_raw, cs_err = await _fetch_with_cloudscraper(url)
+        if cs_status == 200 and cs_raw:
+            status = cs_status
+            raw    = cs_raw
+            result["_crawl_note"] = "✅ Fetched via Cloudflare bypass (cloudscraper)"
+        else:
+            result["_crawl_note"] = (
+                f"❌ Both methods failed. Direct: {block_reason or 'no response'}. "
+                f"Cloudscraper: {cs_err or 'failed'}"
+            )
+            result["page_status"] = status
+            return result
     # ── JS-SPA Playwright fallback ────────────────────────────────
     try:
         _quick = BeautifulSoup(raw.decode("utf-8", errors="replace"), "html.parser").get_text()
