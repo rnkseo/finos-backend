@@ -8,7 +8,7 @@ from fastapi import FastAPI
 from pydantic import BaseModel
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
-import aiohttp, asyncio, os, json, re, time, random
+import aiohttp, asyncio, os, json, re, time
 from bs4 import BeautifulSoup
 from urllib.parse import urlparse, urljoin, urldefrag
 from collections import Counter
@@ -29,46 +29,6 @@ HEADERS = {
     "Connection": "keep-alive",
     "Cache-Control": "no-cache",
 }
-
-# ── NEW: fallback UA pool, used ONLY when primary request is blocked ─────────
-_FALLBACK_UA_HEADERS = [
-    {   # Chrome 123 Mac + full Sec-Fetch headers
-        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
-        "Accept-Language": "en-US,en;q=0.9",
-        "Accept-Encoding": "gzip, deflate, br",
-        "Connection": "keep-alive",
-        "Cache-Control": "no-cache",
-        "Upgrade-Insecure-Requests": "1",
-        "Sec-Fetch-Dest": "document",
-        "Sec-Fetch-Mode": "navigate",
-        "Sec-Fetch-Site": "none",
-        "Sec-Fetch-User": "?1",
-        "Sec-CH-UA": '"Chromium";v="123", "Google Chrome";v="123", "Not-A.Brand";v="99"',
-        "Sec-CH-UA-Mobile": "?0",
-        "Sec-CH-UA-Platform": '"macOS"',
-    },
-    {   # Firefox 125 Windows
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:125.0) Gecko/20100101 Firefox/125.0",
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-        "Accept-Language": "en-US,en;q=0.5",
-        "Accept-Encoding": "gzip, deflate, br",
-        "Connection": "keep-alive",
-        "Cache-Control": "no-cache",
-        "Upgrade-Insecure-Requests": "1",
-    },
-]
-
-# Body patterns that mean the site sent a bot-challenge page (even at HTTP 200)
-_BLOCK_BODY = [b"just a moment", b"checking your browser", b"cf-browser-verification",
-               b"enable javascript and cookies", b"ddos-guard", b"bot detected",
-               b"automated access", b"captcha", b"security check"]
-
-def _is_blocked(raw: bytes) -> bool:
-    low = raw[:4096].lower()
-    return any(p in low for p in _BLOCK_BODY)
-# ── END NEW ──────────────────────────────────────────────────────────────────
-
 
 # ═══════════════════════════════════════════
 # DUAL AI MODEL MANAGER
@@ -397,39 +357,11 @@ async def extract_page(session, url: str, keyword: str, manual: dict) -> dict:
         "backlinks":manual.get("backlinks","N/A"),"plagiarism":manual.get("plagiarism","N/A"),
     }
     try:
-        # ── Primary attempt: original behaviour, completely unchanged ────────
-        text = None
         async with session.get(url,timeout=aiohttp.ClientTimeout(total=25),ssl=False,
                                headers=HEADERS,allow_redirects=True) as resp:
-            result["page_status"] = resp.status
-            if resp.status == 200:
-                raw = await resp.read()
-                if not _is_blocked(raw):
-                    text = raw.decode(resp.charset or "utf-8", errors="replace")
-
-        # ── Fallback: only runs when primary was blocked or returned non-200 ─
-        # Normal sites never reach this code — zero impact on existing behaviour.
-        if text is None and result["page_status"] in (200, 403, 429, 503, 530, 0):
-            for fallback_headers in _FALLBACK_UA_HEADERS:
-                try:
-                    await asyncio.sleep(0.5 + random.random() * 0.5)
-                    conn = aiohttp.TCPConnector(ssl=False, limit=5)
-                    async with aiohttp.ClientSession(connector=conn) as fb_sess:
-                        async with fb_sess.get(url, timeout=aiohttp.ClientTimeout(total=25),
-                                               headers=fallback_headers, allow_redirects=True) as fb_resp:
-                            if fb_resp.status == 200:
-                                raw = await fb_resp.read()
-                                if not _is_blocked(raw):
-                                    result["page_status"] = 200
-                                    text = raw.decode(fb_resp.charset or "utf-8", errors="replace")
-                                    break
-                except Exception:
-                    continue
-
-        if text is None or result["page_status"] != 200:
-            return result
-        # ── End of new code — everything below is original, unchanged ────────
-
+            result["page_status"]=resp.status
+            if resp.status!=200: return result
+            text=await resp.text(errors="ignore")
         soup=BeautifulSoup(text,"html.parser")
         domain=urlparse(url).netloc
 
